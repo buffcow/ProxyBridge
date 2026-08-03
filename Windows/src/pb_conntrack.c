@@ -363,9 +363,7 @@ void cleanup_stale_connections(void)
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;
                 rev_unlink(to_free);              // must run under the exclusive lock
-                ReleaseSRWLockExclusive(&lock);
                 free(to_free);
-                AcquireSRWLockExclusive(&lock);
             }
             else
             {
@@ -386,9 +384,7 @@ void cleanup_stale_connections(void)
             {
                 PID_CACHE_ENTRY *to_free = *entry_ptr;
                 *entry_ptr = (*entry_ptr)->next;
-                ReleaseSRWLockExclusive(&lock);
                 free(to_free);
-                AcquireSRWLockExclusive(&lock);
             }
             else
             {
