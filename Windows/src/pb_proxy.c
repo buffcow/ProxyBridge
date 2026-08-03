@@ -52,12 +52,71 @@ BOOL is_proxy_config_referenced(UINT32 config_id)
     return referenced;
 }
 
+UINT32 get_proxy_resolved_ip(PROXY_CONFIG *cfg, BOOL force_refresh)
+{
+    if (cfg == NULL || cfg->host[0] == '\0')
+        return 0;
+
+    UINT32 literal_ip = parse_ipv4(cfg->host);
+    if (literal_ip != 0)
+        return literal_ip;
+
+    ULONGLONG now = GetTickCount64();
+    if (!force_refresh && cfg->resolved_ip != 0 &&
+        now - cfg->resolved_at < PROXY_DNS_CACHE_TTL_MS)
+    {
+        return cfg->resolved_ip;
+    }
+
+    UINT32 refreshed = resolve_hostname(cfg->host);
+    if (refreshed != 0)
+    {
+        cfg->resolved_ip = refreshed;
+        cfg->resolved_at = now;
+        return refreshed;
+    }
+
+    // A transient DNS failure should not discard the last usable address.
+    return cfg->resolved_ip;
+}
+
+SOCKET open_connected_proxy_socket(const PROXY_CONFIG *cfg, UINT32 proxy_ip, DWORD *out_error)
+{
+    if (out_error != NULL) *out_error = 0;
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET)
+    {
+        if (out_error != NULL) *out_error = (DWORD)WSAGetLastError();
+        return INVALID_SOCKET;
+    }
+
+    configure_tcp_socket(sock, 4194304, PROXY_HANDSHAKE_TIMEOUT_MS);
+
+    struct sockaddr_in proxy_addr;
+    memset(&proxy_addr, 0, sizeof(proxy_addr));
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_addr.s_addr = proxy_ip;
+    proxy_addr.sin_port = htons(cfg->port);
+
+    if (connect_with_timeout(sock, (struct sockaddr *)&proxy_addr, sizeof(proxy_addr),
+                             TCP_PROXY_CONNECT_TIMEOUT_MS) == SOCKET_ERROR)
+    {
+        if (out_error != NULL) *out_error = (DWORD)WSAGetLastError();
+        closesocket(sock);
+        return INVALID_SOCKET;
+    }
+
+    return sock;
+}
+
 PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password, BOOL send_domain_to_proxy)
 {
     if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
         return 0;
 
-    if (resolve_hostname(proxy_ip) == 0)
+    UINT32 resolved = resolve_hostname(proxy_ip);
+    if (resolved == 0)
         return 0;
 
     if (g_proxy_config_count >= MAX_PROXY_CONFIGS)
@@ -71,7 +130,8 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     cfg->port      = proxy_port;
     cfg->send_domain_to_proxy = send_domain_to_proxy;
     strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
-    cfg->resolved_ip = resolve_hostname(proxy_ip);
+    cfg->resolved_ip = resolved;
+    cfg->resolved_at = GetTickCount64();
     if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
     if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
     cfg->udp_tcp_ctrl  = INVALID_SOCKET;
@@ -107,6 +167,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType typ
             cfg->send_domain_to_proxy = send_domain_to_proxy;
             strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
             cfg->resolved_ip = resolved;
+            cfg->resolved_at = GetTickCount64();
             cfg->username[0] = '\0';
             cfg->password[0] = '\0';
             if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
@@ -357,4 +418,3 @@ PROXYBRIDGE_API int ProxyBridge_TestProxyConfigEx(UINT32 config_id, const char* 
 
     #undef TLOG
 }
-

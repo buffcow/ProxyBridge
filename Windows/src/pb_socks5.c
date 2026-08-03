@@ -7,10 +7,10 @@
 // type in its reply  seperatly of the request's ATYP few proxies answer an IPv6 CONNECT with a 4-byte IPv4 0.0.0.0 BND.addr
 //  parse the 4-byte header
 // (VER REP RSV ATYP) and then drain the variable-length BND.ADDR + BND.PORT by ATYP
-int socks5_read_connect_reply(SOCKET s, int *reply)
+int socks5_read_connect_reply(SOCKET s, int *reply, ULONGLONG deadline)
 {
     unsigned char hdr[4];
-    int len = recv_n(s, (char*)hdr, 4);
+    int len = recv_n_until(s, (char*)hdr, 4, deadline);
     if (reply) *reply = (len >= 2) ? hdr[1] : -1;
     if (len != 4 || hdr[0] != SOCKS5_VERSION || hdr[1] != 0x00) return -1;
 
@@ -20,13 +20,13 @@ int socks5_read_connect_reply(SOCKET s, int *reply)
     else if (hdr[3] == SOCKS5_ATYP_DOMAIN)
     {
         unsigned char dlen;
-        if (recv_n(s, (char*)&dlen, 1) != 1) return -1;
+        if (recv_n_until(s, (char*)&dlen, 1, deadline) != 1) return -1;
         drain = (int)dlen + 2;
     }
     else return -1;   // unknown ATYP
 
     unsigned char scratch[270];   // max drain = 255 + 2 (domain) < 270
-    if (drain > 0 && recv_n(s, (char*)scratch, drain) != drain) return -1;
+    if (drain > 0 && recv_n_until(s, (char*)scratch, drain, deadline) != drain) return -1;
     return 0;
 }
 
@@ -34,6 +34,7 @@ int socks5_read_connect_reply(SOCKET s, int *reply)
 
 int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
+    ULONGLONG deadline = GetTickCount64() + PROXY_HANDSHAKE_TIMEOUT_MS;
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
     BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
@@ -42,7 +43,7 @@ int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, cons
     if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
     else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
 
-    len = recv_n(s, (char*)buf, 2);
+    len = recv_n_until(s, (char*)buf, 2, deadline);
     if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
 
     if (buf[1] == 0x02)
@@ -56,7 +57,7 @@ int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, cons
         buf[2 + user_len] = (unsigned char)pass_len;
         memcpy(&buf[3 + user_len], cfg->password, pass_len);
         if (send(s, (char*)buf, (int)(3 + user_len + pass_len), 0) != (int)(3 + user_len + pass_len)) return -1;
-        len = recv_n(s, (char*)buf, 2);
+        len = recv_n_until(s, (char*)buf, 2, deadline);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
     }
     else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
@@ -78,7 +79,7 @@ int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, cons
     if (send(s, (char*)buf, req_len, 0) != req_len) return -1;
 
     int reply;
-    if (socks5_read_connect_reply(s, &reply) != 0)
+    if (socks5_read_connect_reply(s, &reply, deadline) != 0)
     {
         log_message("SOCKS5 domain: CONNECT failed (reply=%d)", reply);
         return -1;
@@ -88,6 +89,7 @@ int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, cons
 
 int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
+    ULONGLONG deadline = GetTickCount64() + PROXY_HANDSHAKE_TIMEOUT_MS;
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
     BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
@@ -115,7 +117,7 @@ int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFI
         }
     }
 
-    len = recv_n(s, (char*)buf, 2);
+    len = recv_n_until(s, (char*)buf, 2, deadline);
     if (len != 2 || buf[0] != SOCKS5_VERSION)
     {
         log_message("SOCKS5: Invalid auth response");
@@ -152,7 +154,7 @@ int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFI
             return -1;
         }
 
-        len = recv_n(s, (char*)buf, 2);
+        len = recv_n_until(s, (char*)buf, 2, deadline);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
         {
             log_message("SOCKS5: Authentication failed");
@@ -184,7 +186,7 @@ int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFI
     }
 
     int reply;
-    if (socks5_read_connect_reply(s, &reply) != 0)
+    if (socks5_read_connect_reply(s, &reply, deadline) != 0)
     {
         log_message("SOCKS5: CONNECT failed (reply=%d)", reply);
         return -1;
@@ -195,6 +197,7 @@ int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFI
 
 int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
+    ULONGLONG deadline = GetTickCount64() + PROXY_HANDSHAKE_TIMEOUT_MS;
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
     BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
@@ -203,7 +206,7 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, cons
     if (use_auth) { buf[1] = 0x02; buf[2] = SOCKS5_AUTH_NONE; buf[3] = 0x02; if (send(s, (char*)buf, 4, 0) != 4) return -1; }
     else          { buf[1] = 0x01; buf[2] = SOCKS5_AUTH_NONE;                 if (send(s, (char*)buf, 3, 0) != 3) return -1; }
 
-    len = recv_n(s, (char*)buf, 2);
+    len = recv_n_until(s, (char*)buf, 2, deadline);
     if (len != 2 || buf[0] != SOCKS5_VERSION) return -1;
 
     if (buf[1] == 0x02)
@@ -217,7 +220,7 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, cons
         buf[2 + ul] = (unsigned char)pl;
         memcpy(&buf[3 + ul], cfg->password, pl);
         if (send(s, (char*)buf, (int)(3 + ul + pl), 0) != (int)(3 + ul + pl)) return -1;
-        len = recv_n(s, (char*)buf, 2);
+        len = recv_n_until(s, (char*)buf, 2, deadline);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00) return -1;
     }
     else if (buf[1] != SOCKS5_AUTH_NONE) return -1;
@@ -235,7 +238,7 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, cons
     // The proxy may reply with any BND.ADDR type (often IPv4 0.0.0.0), not necessarily
     // IPv6 - so parse the reply by ATYP instead of demanding a fixed 22-byte response.
     int reply;
-    if (socks5_read_connect_reply(s, &reply) != 0)
+    if (socks5_read_connect_reply(s, &reply, deadline) != 0)
     {
         log_message("SOCKS5 IPv6: CONNECT failed (reply=%d)", reply);
         return -1;
@@ -245,6 +248,7 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, cons
 
 int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg)
 {
+    ULONGLONG deadline = GetTickCount64() + PROXY_HANDSHAKE_TIMEOUT_MS;
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
     BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
@@ -266,7 +270,7 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
             return -1;
     }
 
-    len = recv_n(s, (char*)buf, 2);
+    len = recv_n_until(s, (char*)buf, 2, deadline);
     if (len != 2 || buf[0] != SOCKS5_VERSION)
         return -1;
 
@@ -289,7 +293,7 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
         if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
             return -1;
 
-        len = recv_n(s, (char*)buf, 2);
+        len = recv_n_until(s, (char*)buf, 2, deadline);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
             return -1;
     }
@@ -317,12 +321,12 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
     // the 4-byte header first, then the bound endpoint by ATYP. We relay UDP over IPv4,
     // so an IPv4 bound endpoint is required (0.0.0.0 is handled by the caller).
     unsigned char rep[4];
-    if (recv_n(s, (char*)rep, 4) != 4 || rep[0] != SOCKS5_VERSION || rep[1] != 0x00)
+    if (recv_n_until(s, (char*)rep, 4, deadline) != 4 || rep[0] != SOCKS5_VERSION || rep[1] != 0x00)
         return -1;
     if (rep[3] != SOCKS5_ATYP_IPV4)
         return -1;   // non-IPv4 relay endpoint can't be used by the IPv4 UDP send socket
     unsigned char ap[6];
-    if (recv_n(s, (char*)ap, 6) != 6)
+    if (recv_n_until(s, (char*)ap, 6, deadline) != 6)
         return -1;
 
     relay_addr->sin_family = AF_INET;
@@ -438,4 +442,3 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
         inet_ntoa(cfg->udp_relay_addr.sin_addr), ntohs(cfg->udp_relay_addr.sin_port));
     return TRUE;
 }
-

@@ -64,12 +64,16 @@ typedef struct PROCESS_RULE {
 #define SOCKS5_ATYP_DOMAIN 0x03  // send hostname to proxy rfc 1928
 #define SOCKS5_AUTH_NONE   0x00
 
-// Idle timeout before a connection-tracking entry is reaped. Clean closes are removed
-// immediately on FIN/RST, so this only sweeps entries whose FIN/RST was missed. It MUST
-// exceed the relay's TCP keepalive interval (5 min) and real idle periods (IMAP IDLE,
-// voice channels, WebSocket, DB pools) - otherwise an open-but-idle proxied connection
-// gets reaped mid-session and silently breaks until restart (issue: hours-long degradation).
-#define CONNECTION_STALE_TIMEOUT_MS 1800000  // 30 minutes
+// Connection setup and lifecycle bounds. Active TCP relays own their mapping until the
+// relay handler exits; only unaccepted/pending TCP mappings and idle UDP mappings are
+// eligible for background cleanup.
+#define UDP_MAPPING_IDLE_TIMEOUT_MS 120000
+#define TCP_PENDING_MAPPING_TIMEOUT_MS 30000
+#define TCP_PROXY_CONNECT_TIMEOUT_MS 5000
+#define PROXY_HANDSHAKE_TIMEOUT_MS 5000
+#define PROXY_DNS_CACHE_TTL_MS 300000
+#define SLOW_PACKET_DECISION_MS 50
+#define SLOW_RELAY_SETUP_MS 250
 
 // DNS snooping cache: maps intercepted A-record answers to their hostnames so
 // that SOCKS5 conect can forward ATYP_DOMAIN instead of ATYP_IPV4, letting
@@ -102,6 +106,8 @@ typedef struct CONNECTION_INFO {
     ULONGLONG last_activity;
     UINT32 proxy_config_id;
     BOOL   is_ipv6;
+    UINT32 mapping_id;          // distinguishes recycled source-port generations
+    volatile LONG relay_active; // live TCP relays own their mapping until handler cleanup
     UINT8  src_ip6[16];        // raw IPv6 src (only valid when is_ipv6)
     UINT8  orig_dest_ip6[16];  // raw IPv6 dest (only valid when is_ipv6)
     struct CONNECTION_INFO *next;      // chain in the forward table (keyed by src_port)
@@ -112,6 +118,8 @@ typedef struct CONNECTION_INFO {
 
 typedef struct {
     SOCKET client_socket;
+    UINT16 client_port;
+    UINT32 mapping_id;
     UINT32 orig_dest_ip;
     UINT16 orig_dest_port;
     UINT32 proxy_config_id;
@@ -165,6 +173,7 @@ typedef struct {
     char password[256];
     BOOL send_domain_to_proxy;  // TRUE = proxy resolves DNS (send hostname), FALSE = send IP
     UINT32 resolved_ip;         // cached at add/edit time - avoids DNS per connection
+    ULONGLONG resolved_at;      // periodically refresh hostname-backed proxy addresses
     ULONGLONG last_udp_attempt;
     SOCKET udp_tcp_ctrl;
     SOCKET udp_send_sock;
@@ -180,6 +189,7 @@ extern int g_proxy_config_count;
 extern UINT32 g_next_config_id;
 extern CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE];
 extern CONNECTION_INFO *connection_rev_table[CONNECTION_HASH_SIZE];
+extern UINT32 g_next_mapping_id;
 extern LOGGED_CONNECTION *logged_connections;
 extern int g_logged_count;  // running length of logged_connections (guarded by `lock`)
 extern PROCESS_RULE *rules_list;
@@ -202,8 +212,8 @@ extern BOOL g_traffic_logging_enabled;
 extern DNS_CACHE_ENTRY    *g_dns_cache[DNS_CACHE_BUCKETS];
 extern DNS_CACHE_ENTRY_V6 *g_dns_cache_v6[DNS_CACHE_BUCKETS];
 extern SRWLOCK             g_dns_cache_lock;
-extern volatile LONG port_decided_bitmap[2048];  // 8 KB
-extern volatile LONG port_direct_bitmap[2048];  // 8 KB
+extern volatile LONG port_decided_bitmap[2][2048];
+extern volatile LONG port_direct_bitmap[2][2048];
 extern UINT16 g_local_relay_port;
 extern BOOL g_localhost_via_proxy;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 extern LogCallback g_log_callback;
@@ -212,28 +222,30 @@ extern char  *g_pidtbl_buf;
 extern DWORD  g_pidtbl_cap;
 
 // ---- per-source-port decision bitmaps: hot-path inline helpers ----
-static __forceinline BOOL port_is_decided(UINT16 p)
+static __forceinline BOOL port_is_decided(UINT16 p, BOOL is_ipv6)
 {
-    return (port_decided_bitmap[p >> 5] >> (p & 31)) & 1;
+    return (port_decided_bitmap[is_ipv6 ? 1 : 0][p >> 5] >> (p & 31)) & 1;
 }
-static __forceinline BOOL port_is_direct(UINT16 p)
+static __forceinline BOOL port_is_direct(UINT16 p, BOOL is_ipv6)
 {
-    return (port_direct_bitmap[p >> 5] >> (p & 31)) & 1;
+    return (port_direct_bitmap[is_ipv6 ? 1 : 0][p >> 5] >> (p & 31)) & 1;
 }
-static __forceinline void port_set_direct(UINT16 p)
+static __forceinline void port_set_direct(UINT16 p, BOOL is_ipv6)
 {
-    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
-    InterlockedOr(&port_direct_bitmap[p >> 5],  (LONG)(1u << (p & 31)));
+    int family = is_ipv6 ? 1 : 0;
+    InterlockedOr(&port_decided_bitmap[family][p >> 5], (LONG)(1u << (p & 31)));
+    InterlockedOr(&port_direct_bitmap[family][p >> 5],  (LONG)(1u << (p & 31)));
 }
-static __forceinline void port_set_decided(UINT16 p)  // decided, but NOT direct (proxy/block)
+static __forceinline void port_set_decided(UINT16 p, BOOL is_ipv6)  // decided, but NOT direct (proxy/block)
 {
-    InterlockedOr(&port_decided_bitmap[p >> 5], (LONG)(1u << (p & 31)));
+    InterlockedOr(&port_decided_bitmap[is_ipv6 ? 1 : 0][p >> 5], (LONG)(1u << (p & 31)));
     // leave port_direct_bitmap bit at 0
 }
-static __forceinline void port_clear(UINT16 p)
+static __forceinline void port_clear(UINT16 p, BOOL is_ipv6)
 {
-    InterlockedAnd(&port_decided_bitmap[p >> 5], (LONG)~(1u << (p & 31)));
-    InterlockedAnd(&port_direct_bitmap[p >> 5],  (LONG)~(1u << (p & 31)));
+    int family = is_ipv6 ? 1 : 0;
+    InterlockedAnd(&port_decided_bitmap[family][p >> 5], (LONG)~(1u << (p & 31)));
+    InterlockedAnd(&port_direct_bitmap[family][p >> 5],  (LONG)~(1u << (p & 31)));
 }
 
 // ---- pb_util.c ----
@@ -246,7 +258,7 @@ void configure_tcp_socket(SOCKET sock, int bufsize, DWORD timeout);
 int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int timeout_ms);
 void configure_udp_socket(SOCKET sock, int bufsize, DWORD timeout);
 int send_all(SOCKET sock, const char *buf, int len);
-int recv_n(SOCKET s, char *buf, int n);
+int recv_n_until(SOCKET s, char *buf, int n, ULONGLONG deadline);
 UINT32 parse_ipv4(const char *ip);
 UINT32 resolve_hostname(const char *hostname);
 void base64_encode(const char* input, char* output, size_t output_size);
@@ -296,6 +308,8 @@ void update_has_active_rules(void);
 PROXY_CONFIG* find_proxy_config(UINT32 config_id);
 BOOL any_socks5_config(void);
 BOOL is_proxy_config_referenced(UINT32 config_id);
+UINT32 get_proxy_resolved_ip(PROXY_CONFIG *cfg, BOOL force_refresh);
+SOCKET open_connected_proxy_socket(const PROXY_CONFIG *cfg, UINT32 proxy_ip, DWORD *out_error);
 
 // ---- pb_dns.c ----
 void dns_cache_init(void);
@@ -311,7 +325,7 @@ void cleanup_stale_dns_cache(void);
 void flush_dns_resolver_cache(void);
 
 // ---- pb_socks5.c ----
-int socks5_read_connect_reply(SOCKET s, int *reply);
+int socks5_read_connect_reply(SOCKET s, int *reply, ULONGLONG deadline);
 int socks5_connect_domain(SOCKET s, const char *hostname, UINT16 dest_port, const PROXY_CONFIG *cfg);
 int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
 int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg);
@@ -329,13 +343,14 @@ void rev_insert(CONNECTION_INFO *c);
 void rev_unlink(CONNECTION_INFO *c);
 void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id);
 void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id);
-BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id);
+BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id, UINT32 *mapping_id);
 BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port);
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
 BOOL get_connection(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port);
-BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id);
+BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id, UINT32 *mapping_id);
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp);
-void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
+BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id);
+BOOL remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mapping_id);
 void cleanup_stale_connections(void);
 BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);
 void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);

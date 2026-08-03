@@ -100,14 +100,18 @@ void configure_tcp_socket(SOCKET sock, int bufsize, DWORD timeout)
 int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int timeout_ms)
 {
     u_long nonblock = 1;
-    ioctlsocket(s, FIONBIO, &nonblock);
+    if (ioctlsocket(s, FIONBIO, &nonblock) == SOCKET_ERROR)
+        return SOCKET_ERROR;
 
     int result = 0;
+    int failure_error = 0;
     if (connect(s, addr, addrlen) == SOCKET_ERROR)
     {
-        if (WSAGetLastError() != WSAEWOULDBLOCK)
+        int connect_error = WSAGetLastError();
+        if (connect_error != WSAEWOULDBLOCK)
         {
             result = SOCKET_ERROR;
+            failure_error = connect_error;
         }
         else
         {
@@ -116,23 +120,38 @@ int connect_with_timeout(SOCKET s, const struct sockaddr *addr, int addrlen, int
             FD_ZERO(&efds); FD_SET(s, &efds);
             struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
             int sel = select(0, NULL, &wfds, &efds, &tv);
-            if (sel <= 0 || FD_ISSET(s, &efds))
+            if (sel == SOCKET_ERROR)
             {
-                result = SOCKET_ERROR;   // timed out or connect failed
+                result = SOCKET_ERROR;
+                failure_error = WSAGetLastError();
+            }
+            else if (sel == 0)
+            {
+                result = SOCKET_ERROR;
+                failure_error = WSAETIMEDOUT;
             }
             else
             {
                 int so_err = 0;
                 int errlen = sizeof(so_err);
-                getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &errlen);
-                if (so_err != 0)
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_err, &errlen) == SOCKET_ERROR)
+                {
                     result = SOCKET_ERROR;
+                    failure_error = WSAGetLastError();
+                }
+                else if (so_err != 0 || FD_ISSET(s, &efds))
+                {
+                    result = SOCKET_ERROR;
+                    failure_error = so_err != 0 ? so_err : WSAECONNREFUSED;
+                }
             }
         }
     }
 
     u_long blocking = 0;
     ioctlsocket(s, FIONBIO, &blocking);   // restore blocking for the handshake reads
+    if (result == SOCKET_ERROR && failure_error != 0)
+        WSASetLastError(failure_error);
     return result;
 }
 
@@ -168,10 +187,33 @@ int send_all(SOCKET sock, const char *buf, int len)
 // split across multiple segments (common on high-latency remote proxies); a single
 // recv() may return fewer bytes than requested, so the fixed-length handshake reads
 // must accumulate. Returns n on success, or SOCKET_ERROR on error / peer close.
-int recv_n(SOCKET s, char *buf, int n)
+int recv_n_until(SOCKET s, char *buf, int n, ULONGLONG deadline)
 {
     int got = 0;
-    while (got < n) {
+    while (got < n)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+        {
+            WSASetLastError(WSAETIMEDOUT);
+            return SOCKET_ERROR;
+        }
+
+        ULONGLONG remaining = deadline - now;
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(s, &read_fds);
+        struct timeval tv = {
+            (long)(remaining / 1000),
+            (long)((remaining % 1000) * 1000)
+        };
+        int ready = select(0, &read_fds, NULL, NULL, &tv);
+        if (ready <= 0)
+        {
+            if (ready == 0) WSASetLastError(WSAETIMEDOUT);
+            return SOCKET_ERROR;
+        }
+
         int r = recv(s, buf + got, n - got, 0);
         if (r <= 0) return SOCKET_ERROR;  // 0 = peer closed, <0 = error/timeout
         got += r;
@@ -250,4 +292,3 @@ void base64_encode(const char* input, char* output, size_t output_size)
     }
     output[output_len] = '\0';
 }
-

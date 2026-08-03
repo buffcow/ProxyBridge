@@ -357,7 +357,7 @@ DWORD WINAPI udp_relay_server(LPVOID arg)
                 UINT16 dest_port = 0;
                 UINT32 proxy_config_id = 0;
 
-                if (get_connection_full_v6(from_port, TRUE, dest_ip6, &dest_port, &proxy_config_id))
+                if (get_connection_full_v6(from_port, TRUE, dest_ip6, &dest_port, &proxy_config_id, NULL))
                 {
                     PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
                     if (cfg != NULL && cfg->type == PROXY_TYPE_SOCKS5)
@@ -483,24 +483,6 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
         if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
             continue;
 
-        // helper lambda-like macro to accept and dispatch a connection
-        #define ACCEPT_AND_DISPATCH(sock, saddr_type, addr_field) do { \
-            saddr_type ca; int cl = sizeof(ca); \
-            SOCKET cs = accept(sock, (struct sockaddr*)&ca, &cl); \
-            if (cs == INVALID_SOCKET) break; \
-            CONNECTION_CONFIG *cc = (CONNECTION_CONFIG*)malloc(sizeof(CONNECTION_CONFIG)); \
-            if (cc == NULL) { closesocket(cs); break; } \
-            cc->client_socket = cs; \
-            UINT16 cp = ntohs(((saddr_type*)&ca)->addr_field); \
-            BOOL ok = cc->is_ipv6 ? \
-                get_connection_full_v6(cp, FALSE, cc->orig_dest_ip6, &cc->orig_dest_port, &cc->proxy_config_id) : \
-                get_connection_full(cp, FALSE, &cc->orig_dest_ip, &cc->orig_dest_port, &cc->proxy_config_id); \
-            if (!ok) { closesocket(cs); free(cc); break; } \
-            HANDLE t = CreateThread(NULL, 1, connection_handler, (LPVOID)cc, 0, NULL); \
-            if (t == NULL) { closesocket(cs); free(cc); break; } \
-            CloseHandle(t); \
-        } while(0)
-
         if (FD_ISSET(listen_sock, &read_fds))
         {
             struct sockaddr_in client_addr;
@@ -509,18 +491,27 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
 
             if (client_sock != INVALID_SOCKET)
             {
-                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
+                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)calloc(1, sizeof(CONNECTION_CONFIG));
                 if (conn_config != NULL)
                 {
                     conn_config->client_socket = client_sock;
+                    conn_config->client_port = ntohs(client_addr.sin_port);
                     conn_config->is_ipv6 = FALSE;
 
-                    UINT16 client_port = ntohs(client_addr.sin_port);
-                    if (get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    UINT16 client_port = conn_config->client_port;
+                    if (get_connection_full(client_port, FALSE, &conn_config->orig_dest_ip,
+                                            &conn_config->orig_dest_port, &conn_config->proxy_config_id,
+                                            &conn_config->mapping_id))
                     {
                         HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
                         if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock); free(conn_config); }
+                        else
+                        {
+                            if (remove_connection(client_port, FALSE, FALSE, conn_config->mapping_id))
+                                port_clear(client_port, FALSE);
+                            closesocket(client_sock);
+                            free(conn_config);
+                        }
                     }
                     else { closesocket(client_sock); free(conn_config); }
                 }
@@ -536,18 +527,27 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
 
             if (client_sock6 != INVALID_SOCKET)
             {
-                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)malloc(sizeof(CONNECTION_CONFIG));
+                CONNECTION_CONFIG *conn_config = (CONNECTION_CONFIG *)calloc(1, sizeof(CONNECTION_CONFIG));
                 if (conn_config != NULL)
                 {
                     conn_config->client_socket = client_sock6;
+                    conn_config->client_port = ntohs(client_addr6.sin6_port);
                     conn_config->is_ipv6 = TRUE;
 
-                    UINT16 client_port = ntohs(client_addr6.sin6_port);
-                    if (get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
+                    UINT16 client_port = conn_config->client_port;
+                    if (get_connection_full_v6(client_port, FALSE, conn_config->orig_dest_ip6,
+                                               &conn_config->orig_dest_port, &conn_config->proxy_config_id,
+                                               &conn_config->mapping_id))
                     {
                         HANDLE conn_thread = CreateThread(NULL, 1, connection_handler, (LPVOID)conn_config, 0, NULL);
                         if (conn_thread != NULL) { CloseHandle(conn_thread); }
-                        else { closesocket(client_sock6); free(conn_config); }
+                        else
+                        {
+                            if (remove_connection(client_port, FALSE, TRUE, conn_config->mapping_id))
+                                port_clear(client_port, TRUE);
+                            closesocket(client_sock6);
+                            free(conn_config);
+                        }
                     }
                     else { closesocket(client_sock6); free(conn_config); }
                 }
@@ -555,8 +555,6 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
             }
         }
     }
-
-    #undef ACCEPT_AND_DISPATCH
 
     closesocket(listen_sock);
     if (listen_sock6 != INVALID_SOCKET) closesocket(listen_sock6);
@@ -568,102 +566,108 @@ DWORD WINAPI connection_handler(LPVOID arg)
 {
     CONNECTION_CONFIG *config = (CONNECTION_CONFIG *)arg;
     SOCKET client_sock = config->client_socket;
+    UINT16 client_port = config->client_port;
+    UINT32 mapping_id = config->mapping_id;
     UINT32 dest_ip = config->orig_dest_ip;
     UINT16 dest_port = config->orig_dest_port;
     UINT32 proxy_config_id = config->proxy_config_id;
     BOOL is_ipv6 = config->is_ipv6;
     UINT8 dest_ip6[16];
     if (is_ipv6) memcpy(dest_ip6, config->orig_dest_ip6, 16);
-    SOCKET socks_sock;
-    struct sockaddr_in socks_addr;
-
     free(config);
+
+    if (!mark_tcp_relay_active(client_port, is_ipv6, mapping_id))
+    {
+        closesocket(client_sock);
+        return 0;
+    }
+
+    ULONGLONG setup_started = GetTickCount64();
+    ULONGLONG connect_started = setup_started;
+    ULONGLONG connected_at = setup_started;
+    ULONGLONG handshake_done_at = setup_started;
+    SOCKET socks_sock = INVALID_SOCKET;
+    DWORD connect_error = 0;
 
     // Look up the proxy config for this connection
     PROXY_CONFIG *proxy = find_proxy_config(proxy_config_id);
     if (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0)
     {
         log_message("[RELAY] No proxy config (id=%u) - dropping connection", proxy_config_id);
-        closesocket(client_sock);
-        return 1;
+        goto cleanup;
     }
 
-    // Connect to proxy, use cached resolved IP to avoid DNS per connection
-    UINT32 proxy_ip = proxy->resolved_ip ? proxy->resolved_ip : resolve_hostname(proxy->host);
+    configure_tcp_socket(client_sock, 4194304, PROXY_HANDSHAKE_TIMEOUT_MS);
+
+    // Preserve the per-config DNS forwarding mode while refreshing the proxy
+    // server's own hostname periodically and after a failed bounded connect.
+    UINT32 proxy_ip = get_proxy_resolved_ip(proxy, FALSE);
     if (proxy_ip == 0)
     {
-        closesocket(client_sock);
-        return 1;
+        log_message("[RELAY] Failed to resolve proxy %s", proxy->host);
+        goto cleanup;
     }
 
-    socks_sock = socket(AF_INET, SOCK_STREAM, 0);
+    connect_started = GetTickCount64();
+    socks_sock = open_connected_proxy_socket(proxy, proxy_ip, &connect_error);
     if (socks_sock == INVALID_SOCKET)
     {
-        log_message("Socket creation failed (%d)", WSAGetLastError());
-        closesocket(client_sock);
-        return 0;
+        UINT32 refreshed_ip = get_proxy_resolved_ip(proxy, TRUE);
+        if (refreshed_ip != 0 && refreshed_ip != proxy_ip)
+        {
+            log_message("[RELAY] Proxy address changed after connect failure; retrying %s:%d", proxy->host, proxy->port);
+            proxy_ip = refreshed_ip;
+            socks_sock = open_connected_proxy_socket(proxy, proxy_ip, &connect_error);
+        }
     }
 
-    // 4 MB kernel socket buffers for the relay sockets.
-    // The upload path writes from client→proxy over a real network with non-zero
-    // RTT; a small (512 KB) send buffer causes send_all() to block the moment
-    // the proxy's receive window fills up, which stalls the relay loop and
-    // triggers TCP flow-control on the client side → massive upload throughput
-    // loss.  4 MB gives plenty of headroom even at high bitrates / high RTT.
-    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB – proxy connection
-    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB – app connection
-
-    memset(&socks_addr, 0, sizeof(socks_addr));
-    socks_addr.sin_family = AF_INET;
-    socks_addr.sin_addr.s_addr = proxy_ip;
-    socks_addr.sin_port = htons(proxy->port);
-
-    if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
+    if (socks_sock == INVALID_SOCKET)
     {
-        log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
-        closesocket(client_sock);
-        closesocket(socks_sock);
-        return 0;
+        log_message("[RELAY] Proxy connect failed %s:%d after %llums (error=%lu)",
+            proxy->host, proxy->port, GetTickCount64() - connect_started, connect_error);
+        goto cleanup;
     }
+    connected_at = GetTickCount64();
 
+    // 4 MB kernel socket buffers prevent send_all() from blocking prematurely on
+    // high-bandwidth/high-RTT upstream connections.
+    configure_tcp_socket(socks_sock, 4194304, PROXY_HANDSHAKE_TIMEOUT_MS);
+    configure_tcp_socket(client_sock, 4194304, PROXY_HANDSHAKE_TIMEOUT_MS);
+
+    int handshake_result = -1;
     if (proxy->type == PROXY_TYPE_SOCKS5)
     {
-        int rc;
         char cached_domain[256];
         // Per-config: only hand the hostname to the proxy (socks5h) when this config
         // opts in; otherwise send the locally-resolved IP (socks5).
         if (is_ipv6)
         {
             if (proxy->send_domain_to_proxy && dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+                handshake_result = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
             else
-                rc = socks5_connect_v6(socks_sock, dest_ip6, dest_port, proxy);
+                handshake_result = socks5_connect_v6(socks_sock, dest_ip6, dest_port, proxy);
         }
         else
         {
             if (proxy->send_domain_to_proxy && dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)))
-                rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
+                handshake_result = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
             else
-                rc = socks5_connect(socks_sock, dest_ip, dest_port, proxy);
-        }
-        if (rc != 0)
-        {
-            closesocket(client_sock);
-            closesocket(socks_sock);
-            return 0;
+                handshake_result = socks5_connect(socks_sock, dest_ip, dest_port, proxy);
         }
     }
     else if (proxy->type == PROXY_TYPE_HTTP)
     {
-        int rc = is_ipv6
+        handshake_result = is_ipv6
             ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
             : http_connect(socks_sock, dest_ip, dest_port, proxy);
-        if (rc != 0)
-        {
-            closesocket(client_sock);
-            closesocket(socks_sock);
-            return 0;
-        }
+    }
+
+    handshake_done_at = GetTickCount64();
+    if (handshake_result != 0)
+    {
+        log_message("[RELAY] Proxy handshake failed %s:%d after %llums",
+            proxy->host, proxy->port, handshake_done_at - connected_at);
+        goto cleanup;
     }
 
     // Disable timeout for data transfer phase
@@ -673,23 +677,31 @@ DWORD WINAPI connection_handler(LPVOID arg)
     setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
     setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&zero_timeout, sizeof(zero_timeout));
 
-    // Enable and configure customized TCP keep-alives
-    struct tcp_keepalive keepalive_settings;
-    keepalive_settings.onoff = 1;
-    keepalive_settings.keepalivetime = 300000;      // 5 minutes in milliseconds
-    keepalive_settings.keepaliveinterval = 1000;    // 1 second interval
+    // Keep only the real upstream connection alive. The synthetic app-side socket's
+    // packets still require WinDivert rewriting and do not keep the tunnel alive.
+    BOOL keepalive_on = TRUE;
+    setsockopt(socks_sock, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepalive_on, sizeof(keepalive_on));
+    struct tcp_keepalive keepalive_settings = { 1, 30000, 5000 };
     DWORD bytes_returned = 0;
-    WSAIoctl(socks_sock, SIO_KEEPALIVE_VALS, &keepalive_settings, sizeof(keepalive_settings), NULL, 0, &bytes_returned, NULL, NULL);
-    WSAIoctl(client_sock, SIO_KEEPALIVE_VALS, &keepalive_settings, sizeof(keepalive_settings), NULL, 0, &bytes_returned, NULL, NULL);
+    if (WSAIoctl(socks_sock, SIO_KEEPALIVE_VALS, &keepalive_settings, sizeof(keepalive_settings),
+                 NULL, 0, &bytes_returned, NULL, NULL) == SOCKET_ERROR)
+    {
+        log_message("[RELAY] Failed to configure upstream keepalive (%d)", WSAGetLastError());
+    }
+
+    ULONGLONG setup_ms = handshake_done_at - setup_started;
+    if (setup_ms >= SLOW_RELAY_SETUP_MS)
+    {
+        log_message("[RELAY TIMING] client_port=%u setup=%llums connect=%llums handshake=%llums",
+            client_port, setup_ms, connected_at - connect_started, handshake_done_at - connected_at);
+    }
 
     TRANSFER_CONFIG *transfer_config = (TRANSFER_CONFIG *)malloc(sizeof(TRANSFER_CONFIG));
 
     if (transfer_config == NULL)
     {
         log_message("Memory allocation failed for transfer_config");
-        closesocket(client_sock);
-        closesocket(socks_sock);
-        return 0;
+        goto cleanup;
     }
 
     transfer_config->from_socket = client_sock;
@@ -699,7 +711,14 @@ DWORD WINAPI connection_handler(LPVOID arg)
     transfer_handler((LPVOID)transfer_config);
 
     // Sockets already closed in transfer_handler!
+    socks_sock = INVALID_SOCKET;
+    client_sock = INVALID_SOCKET;
 
+cleanup:
+    if (client_sock != INVALID_SOCKET) closesocket(client_sock);
+    if (socks_sock != INVALID_SOCKET) closesocket(socks_sock);
+    if (remove_connection(client_port, FALSE, is_ipv6, mapping_id))
+        port_clear(client_port, is_ipv6);
     return 0;
 }
 
@@ -808,4 +827,3 @@ DWORD WINAPI transfer_handler(LPVOID arg)
 
     return 0;
 }
-

@@ -36,6 +36,14 @@ void rev_unlink(CONNECTION_INFO *c)
     c->rev_next = NULL;
 }
 
+static UINT32 next_mapping_id_locked(void)
+{
+    UINT32 mapping_id = g_next_mapping_id++;
+    if (g_next_mapping_id == 0)
+        g_next_mapping_id = 1;
+    return mapping_id;
+}
+
 void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id)
 {
     AcquireSRWLockExclusive(&lock);
@@ -54,6 +62,8 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->mapping_id = next_mapping_id_locked();
+            existing->relay_active = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -76,6 +86,8 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
     conn->proxy_config_id = proxy_config_id;
     conn->is_tracked = TRUE;
     conn->is_ipv6 = FALSE;
+    conn->mapping_id = next_mapping_id_locked();
+    conn->relay_active = 0;
     conn->last_activity = GetTickCount64();
 
     conn->next = connection_hash_table[hash];
@@ -100,6 +112,8 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->mapping_id = next_mapping_id_locked();
+            existing->relay_active = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -119,6 +133,8 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
     conn->src_ip = 0;
     conn->orig_dest_ip = 0;
     conn->is_ipv6 = TRUE;
+    conn->mapping_id = next_mapping_id_locked();
+    conn->relay_active = 0;
     memcpy(conn->src_ip6, src_ip6, 16);
     memcpy(conn->orig_dest_ip6, dest_ip6, 16);
     conn->orig_dest_port = dest_port;
@@ -131,7 +147,8 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
     ReleaseSRWLockExclusive(&lock);
 }
 
-BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id)
+BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port,
+                            UINT32 *proxy_config_id, UINT32 *mapping_id)
 {
     BOOL found = FALSE;
     AcquireSRWLockShared(&lock);
@@ -142,6 +159,7 @@ BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UI
             memcpy(dest_ip6, conn->orig_dest_ip6, 16);
             *dest_port = conn->orig_dest_port;
             if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
+            if (mapping_id != NULL) *mapping_id = conn->mapping_id;
             InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             found = TRUE;
             break;
@@ -186,6 +204,7 @@ BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
     while (conn != NULL) {
         if (conn->src_port == src_port && conn->is_udp == is_udp && conn->is_ipv6 == is_ipv6 && conn->is_tracked) {
             tracked = TRUE;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             break;
         }
         conn = conn->next;
@@ -220,7 +239,8 @@ BOOL get_connection(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_
     return found;
 }
 
-BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id)
+BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port,
+                         UINT32 *proxy_config_id, UINT32 *mapping_id)
 {
     BOOL found = FALSE;
 
@@ -236,6 +256,7 @@ BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *
             *dest_ip = conn->orig_dest_ip;
             *dest_port = conn->orig_dest_port;
             if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
+            if (mapping_id != NULL) *mapping_id = conn->mapping_id;
             InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             found = TRUE;
             break;
@@ -270,8 +291,33 @@ UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp)
     return proxy_config_id;
 }
 
-void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
+BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
 {
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port && !conn->is_udp && conn->is_ipv6 == is_ipv6 &&
+            conn->mapping_id == mapping_id)
+        {
+            InterlockedExchange(&conn->relay_active, 1);
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+BOOL remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mapping_id)
+{
+    BOOL removed = FALSE;
     AcquireSRWLockExclusive(&lock);
 
     int hash = src_port % CONNECTION_HASH_SIZE;
@@ -279,17 +325,21 @@ void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
 
     while (*conn_ptr != NULL)
     {
-        if ((*conn_ptr)->src_port == src_port && (*conn_ptr)->is_udp == is_udp && (*conn_ptr)->is_ipv6 == is_ipv6)
+        if ((*conn_ptr)->src_port == src_port &&
+            (*conn_ptr)->is_udp == is_udp && (*conn_ptr)->is_ipv6 == is_ipv6 &&
+            (*conn_ptr)->mapping_id == mapping_id)
         {
             CONNECTION_INFO *to_free = *conn_ptr;
             *conn_ptr = (*conn_ptr)->next;
             rev_unlink(to_free);
             free(to_free);
+            removed = TRUE;
             break;
         }
         conn_ptr = &(*conn_ptr)->next;
     }
     ReleaseSRWLockExclusive(&lock);
+    return removed;
 }
 
 void cleanup_stale_connections(void)
@@ -303,7 +353,12 @@ void cleanup_stale_connections(void)
 
         while (*conn_ptr != NULL)
         {
-            if (now - (*conn_ptr)->last_activity > CONNECTION_STALE_TIMEOUT_MS)
+            ULONGLONG idle_ms = now - (*conn_ptr)->last_activity;
+            BOOL expired_udp = (*conn_ptr)->is_udp && idle_ms > UDP_MAPPING_IDLE_TIMEOUT_MS;
+            BOOL expired_pending_tcp = !(*conn_ptr)->is_udp &&
+                InterlockedCompareExchange(&(*conn_ptr)->relay_active, 0, 0) == 0 &&
+                idle_ms > TCP_PENDING_MAPPING_TIMEOUT_MS;
+            if (expired_udp || expired_pending_tcp)
             {
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;
@@ -452,4 +507,3 @@ void clear_logged_connections(void)
 
     ReleaseSRWLockExclusive(&lock);
 }
-
