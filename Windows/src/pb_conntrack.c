@@ -38,13 +38,12 @@ void rev_unlink(CONNECTION_INFO *c)
 
 static UINT32 next_mapping_id_locked(void)
 {
-    UINT32 mapping_id = g_next_mapping_id++;
-    if (g_next_mapping_id == 0)
-        g_next_mapping_id = 1;
-    return mapping_id;
+    UINT32 id = g_next_mapping_id++;
+    if (g_next_mapping_id == 0) g_next_mapping_id = 1;
+    return id;
 }
 
-void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id)
+void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id, DWORD pid, UINT32 rule_id)
 {
     AcquireSRWLockExclusive(&lock);
 
@@ -57,13 +56,17 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
         if (existing->src_port == src_port && existing->is_udp == is_udp && !existing->is_ipv6) {
             rev_unlink(existing);   // dest may change (port reuse) - re-key the reverse index
             existing->is_ipv6 = FALSE;
+            existing->pid = pid;
+            existing->rule_id = rule_id;
             existing->src_ip = src_ip;
             existing->orig_dest_ip = dest_ip;
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->fin_flags = 0;
             existing->mapping_id = next_mapping_id_locked();
             existing->relay_active = 0;
+            existing->up_bytes = existing->down_bytes = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -80,6 +83,8 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
 
     conn->src_port = src_port;
     conn->is_udp = is_udp;
+    conn->pid = pid;
+    conn->rule_id = rule_id;
     conn->src_ip = src_ip;
     conn->orig_dest_ip = dest_ip;
     conn->orig_dest_port = dest_port;
@@ -96,7 +101,7 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
     ReleaseSRWLockExclusive(&lock);
 }
 
-void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id)
+void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], const UINT8 dest_ip6[16], UINT16 dest_port, UINT32 proxy_config_id, DWORD pid, UINT32 rule_id)
 {
     AcquireSRWLockExclusive(&lock);
 
@@ -107,13 +112,17 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
         if (existing->src_port == src_port && existing->is_udp == is_udp && existing->is_ipv6) {
             rev_unlink(existing);   // dest may change (port reuse) - re-key the reverse index
             existing->is_ipv6 = TRUE;
+            existing->pid = pid;
+            existing->rule_id = rule_id;
             memcpy(existing->src_ip6, src_ip6, 16);
             memcpy(existing->orig_dest_ip6, dest_ip6, 16);
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->fin_flags = 0;
             existing->mapping_id = next_mapping_id_locked();
             existing->relay_active = 0;
+            existing->up_bytes = existing->down_bytes = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -130,6 +139,8 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
 
     conn->src_port = src_port;
     conn->is_udp = is_udp;
+    conn->pid = pid;
+    conn->rule_id = rule_id;
     conn->src_ip = 0;
     conn->orig_dest_ip = 0;
     conn->is_ipv6 = TRUE;
@@ -148,7 +159,12 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
 }
 
 BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port,
-                            UINT32 *proxy_config_id, UINT32 *mapping_id)
+                            UINT32 *proxy_config_id)
+{
+    return get_connection_full_v6_x(src_port, is_udp, dest_ip6, dest_port, proxy_config_id, NULL, NULL, 0);
+}
+
+BOOL get_connection_full_v6_x(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UINT16 *dest_port, UINT32 *proxy_config_id, DWORD *pid, UINT32 *rule_id, UINT32 acct_up)
 {
     BOOL found = FALSE;
     AcquireSRWLockShared(&lock);
@@ -159,7 +175,9 @@ BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UI
             memcpy(dest_ip6, conn->orig_dest_ip6, 16);
             *dest_port = conn->orig_dest_port;
             if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
-            if (mapping_id != NULL) *mapping_id = conn->mapping_id;
+            if (pid != NULL) *pid = conn->pid;
+            if (rule_id != NULL) *rule_id = conn->rule_id;
+            if (acct_up) InterlockedExchangeAdd64(&conn->up_bytes, (LONG64)acct_up);
             InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             found = TRUE;
             break;
@@ -171,10 +189,11 @@ BOOL get_connection_full_v6(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], UI
 }
 
 // Reverse lookup for IPv6 UDP relay responses: find src addr+port by orig dest ip6+port
-BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port)
+BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UINT8 src_ip6[16], UINT16 *src_port, UINT32 acct_down)
 {
     BOOL found = FALSE;
     ULONGLONG best = 0;
+    CONNECTION_INFO *winner = NULL;
     AcquireSRWLockShared(&lock);
     // O(1): only the reverse bucket for this (dest ip6, dest port).
     for (CONNECTION_INFO *conn = connection_rev_table[rev_hash_v6(orig_dest_ip6, orig_dest_port)];
@@ -186,11 +205,92 @@ BOOL find_v6_udp_sender(const UINT8 orig_dest_ip6[16], UINT16 orig_dest_port, UI
                 *src_port = conn->src_port;
                 best = conn->last_activity;
                 found = TRUE;
+                winner = conn;
             }
         }
     }
+    if (winner != NULL && acct_down) InterlockedExchangeAdd64(&winner->down_bytes, (LONG64)acct_down);
     ReleaseSRWLockShared(&lock);
     return found;
+}
+
+// ---- UDP flow validation + direct-decision cache (see pb_internal.h) ----
+BOOL udp_flow_validate(UINT16 src_port, BOOL is_ipv6, UINT32 dest_ip, const UINT8 dest_ip6[16], UINT16 dest_port)
+{
+    ULONGLONG now = GetTickCount64();
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    BOOL need_write = FALSE, valid = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    CONNECTION_INFO *c = connection_hash_table[hash];
+    while (c != NULL && !(c->src_port == src_port && c->is_udp && c->is_ipv6 == is_ipv6)) c = c->next;
+    if (c == NULL) { ReleaseSRWLockShared(&lock); return FALSE; }
+    BOOL same = (c->orig_dest_port == dest_port) &&
+                (is_ipv6 ? memcmp(c->orig_dest_ip6, dest_ip6, 16) == 0 : c->orig_dest_ip == dest_ip);
+    if (c->last_activity < now && now - c->last_activity > UDP_REEVAL_IDLE_MS) need_write = TRUE;   // evict (guard: another thread may have stamped a later tick)
+    else if (same) { InterlockedExchange64((LONGLONG volatile*)&c->last_activity, (LONGLONG)now); valid = TRUE; }
+    else need_write = TRUE;                                                   // retarget
+    ReleaseSRWLockShared(&lock);
+    if (!need_write) return valid;
+
+    AcquireSRWLockExclusive(&lock);
+    CONNECTION_INFO **pp = &connection_hash_table[hash];
+    while (*pp != NULL && !((*pp)->src_port == src_port && (*pp)->is_udp && (*pp)->is_ipv6 == is_ipv6)) pp = &(*pp)->next;
+    c = *pp;
+    if (c == NULL) { ReleaseSRWLockExclusive(&lock); return FALSE; }
+    if (c->last_activity < now && now - c->last_activity > UDP_REEVAL_IDLE_MS)
+    {
+        *pp = c->next;
+        rev_unlink(c);
+        free(c);
+        valid = FALSE;
+    }
+    else
+    {
+        rev_unlink(c);                       // dest changes: re-key the reverse index
+        c->orig_dest_port = dest_port;
+        if (is_ipv6) memcpy(c->orig_dest_ip6, dest_ip6, 16); else c->orig_dest_ip = dest_ip;
+        c->last_activity = now;
+        rev_insert(c);
+        valid = TRUE;
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return valid;
+}
+
+#define UDP_DIRECT_SLOTS 4096
+typedef struct { UINT8 dst[16]; UINT16 sp, dp; BOOL v6; DWORD until; } UDP_DIRECT_ENTRY;
+static UDP_DIRECT_ENTRY g_udp_direct[UDP_DIRECT_SLOTS];
+
+static UDP_DIRECT_ENTRY *udp_direct_slot(BOOL v6, const void *dst, UINT16 sp, UINT16 dp, UINT8 key[16])
+{
+    memset(key, 0, 16);
+    memcpy(key, dst, v6 ? 16 : 4);
+    UINT32 h = ((UINT32)sp << 16) ^ dp ^ (v6 ? 0x9E3779B9u : 0);
+    for (int i = 0; i < 16; i++) h = h * 31u + key[i];
+    return &g_udp_direct[h % UDP_DIRECT_SLOTS];
+}
+
+BOOL udp_direct_cached(BOOL is_ipv6, const void *dst, UINT16 src_port, UINT16 dst_port)
+{
+    UINT8 key[16];
+    UDP_DIRECT_ENTRY *e = udp_direct_slot(is_ipv6, dst, src_port, dst_port, key);
+    return e->until != 0 && e->sp == src_port && e->dp == dst_port && e->v6 == is_ipv6 &&
+           memcmp(e->dst, key, 16) == 0 && (int)(e->until - GetTickCount()) > 0;
+}
+
+void udp_direct_remember(BOOL is_ipv6, const void *dst, UINT16 src_port, UINT16 dst_port)
+{
+    UINT8 key[16];
+    UDP_DIRECT_ENTRY *e = udp_direct_slot(is_ipv6, dst, src_port, dst_port, key);
+    memcpy(e->dst, key, 16); e->sp = src_port; e->dp = dst_port; e->v6 = is_ipv6;
+    DWORD u = GetTickCount() + UDP_DIRECT_TTL_MS;
+    e->until = u ? u : 1;
+}
+
+void udp_direct_reset(void)
+{
+    memset(g_udp_direct, 0, sizeof(g_udp_direct));
 }
 
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
@@ -240,7 +340,12 @@ BOOL get_connection(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_
 }
 
 BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port,
-                         UINT32 *proxy_config_id, UINT32 *mapping_id)
+                         UINT32 *proxy_config_id)
+{
+    return get_connection_full_x(src_port, is_udp, dest_ip, dest_port, proxy_config_id, NULL, NULL, 0);
+}
+
+BOOL get_connection_full_x(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id, DWORD *pid, UINT32 *rule_id, UINT32 acct_up)
 {
     BOOL found = FALSE;
 
@@ -256,7 +361,9 @@ BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *
             *dest_ip = conn->orig_dest_ip;
             *dest_port = conn->orig_dest_port;
             if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
-            if (mapping_id != NULL) *mapping_id = conn->mapping_id;
+            if (pid != NULL) *pid = conn->pid;
+            if (rule_id != NULL) *rule_id = conn->rule_id;
+            if (acct_up) InterlockedExchangeAdd64(&conn->up_bytes, (LONG64)acct_up);
             InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             found = TRUE;
             break;
@@ -291,6 +398,30 @@ UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp)
     return proxy_config_id;
 }
 
+BOOL get_tcp_connection_config(UINT16 src_port, BOOL is_ipv6, CONNECTION_CONFIG *out)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[src_port % CONNECTION_HASH_SIZE]; c; c = c->next)
+    {
+        if (c->src_port != src_port || c->is_udp || c->is_ipv6 != is_ipv6) continue;
+        out->client_port = src_port;
+        out->is_ipv6 = is_ipv6;
+        out->mapping_id = c->mapping_id;
+        out->orig_dest_ip = c->orig_dest_ip;
+        memcpy(out->orig_dest_ip6, c->orig_dest_ip6, sizeof(out->orig_dest_ip6));
+        out->orig_dest_port = c->orig_dest_port;
+        out->proxy_config_id = c->proxy_config_id;
+        out->pid = c->pid;
+        out->rule_id = c->rule_id;
+        InterlockedExchange64((LONGLONG volatile *)&c->last_activity, (LONGLONG)GetTickCount64());
+        found = TRUE;
+        break;
+    }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
 {
     BOOL found = FALSE;
@@ -315,7 +446,12 @@ BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
     return found;
 }
 
-BOOL remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mapping_id)
+void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
+{
+    remove_connection_mapping(src_port, is_udp, is_ipv6, 0);
+}
+
+BOOL remove_connection_mapping(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mapping_id)
 {
     BOOL removed = FALSE;
     AcquireSRWLockExclusive(&lock);
@@ -327,12 +463,14 @@ BOOL remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mappin
     {
         if ((*conn_ptr)->src_port == src_port &&
             (*conn_ptr)->is_udp == is_udp && (*conn_ptr)->is_ipv6 == is_ipv6 &&
-            (*conn_ptr)->mapping_id == mapping_id)
+            (mapping_id == 0 || (*conn_ptr)->mapping_id == mapping_id))
         {
             CONNECTION_INFO *to_free = *conn_ptr;
             *conn_ptr = (*conn_ptr)->next;
             rev_unlink(to_free);
             free(to_free);
+            // Clear under the same lock: an old relay must never clear a new generation's decision.
+            if (!is_udp) port_clear(src_port, is_ipv6);
             removed = TRUE;
             break;
         }
@@ -340,6 +478,62 @@ BOOL remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mappin
     }
     ReleaseSRWLockExclusive(&lock);
     return removed;
+}
+
+void connection_fin(UINT16 src_port, BOOL is_ipv6, UINT8 bit)
+{
+    AcquireSRWLockExclusive(&lock);
+    CONNECTION_INFO **pp = &connection_hash_table[src_port % CONNECTION_HASH_SIZE];
+    while (*pp != NULL && !((*pp)->src_port == src_port && !(*pp)->is_udp && (*pp)->is_ipv6 == is_ipv6))
+        pp = &(*pp)->next;
+    CONNECTION_INFO *c = *pp;
+    if (c != NULL)
+    {
+        c->fin_flags |= bit;
+        if (c->fin_flags == 3 && InterlockedCompareExchange(&c->relay_active, 0, 0) == 0)
+        {
+            *pp = c->next;
+            rev_unlink(c);
+            free(c);
+            port_clear(src_port, is_ipv6);
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Live proxied UDP flows for the live connections view. A UDP flow has no close event, so "live" means traffic in the
+// last UDP_FLOW_LIVE_MS; the view marks it closed when it stops being listed. One pass over the table under the shared
+// lock (4096 buckets), only when a client polls.
+UINT32 udp_flows_snapshot(PB_FLOW *out, UINT32 max)
+{
+    UINT32 n = 0;
+    ULONGLONG now = GetTickCount64();
+    AcquireSRWLockShared(&lock);
+    for (int i = 0; i < CONNECTION_HASH_SIZE && n < max; i++)
+    {
+        for (CONNECTION_INFO *c = connection_hash_table[i]; c != NULL && n < max; c = c->next)
+        {
+            if (!c->is_udp || !c->is_tracked) continue;
+            ULONGLONG last = c->last_activity;
+            if (last <= now && now - last > UDP_FLOW_LIVE_MS) continue;
+            PB_FLOW *f = &out[n++];
+            ZeroMemory(f, sizeof(*f));
+            f->id = ((UINT64)1 << 63) | ((UINT64)c->src_port << 1) | (c->is_ipv6 ? 1u : 0u);
+            f->pid = c->pid;
+            f->proxy_config_id = c->proxy_config_id;
+            f->rule_id = c->rule_id;
+            f->age_ms = 0xFFFFFFFFu;
+            f->sent = (UINT64)c->up_bytes;
+            f->received = (UINT64)c->down_bytes;
+            f->port = c->orig_dest_port;
+            f->is_udp = 1;
+            f->is_ipv6 = c->is_ipv6 ? 1 : 0;
+            if (c->is_ipv6) memcpy(f->dest, c->orig_dest_ip6, 16);
+            else memcpy(f->dest, &c->orig_dest_ip, 4);
+        }
+    }
+    ReleaseSRWLockShared(&lock);
+    return n;
 }
 
 void cleanup_stale_connections(void)
@@ -353,7 +547,8 @@ void cleanup_stale_connections(void)
 
         while (*conn_ptr != NULL)
         {
-            ULONGLONG idle_ms = now - (*conn_ptr)->last_activity;
+            ULONGLONG last_activity = (*conn_ptr)->last_activity;
+            ULONGLONG idle_ms = now >= last_activity ? now - last_activity : 0;
             BOOL expired_udp = (*conn_ptr)->is_udp && idle_ms > UDP_MAPPING_IDLE_TIMEOUT_MS;
             BOOL expired_pending_tcp = !(*conn_ptr)->is_udp &&
                 InterlockedCompareExchange(&(*conn_ptr)->relay_active, 0, 0) == 0 &&
@@ -446,6 +641,8 @@ BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, R
 
 void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action)
 {
+    if (g_log_every_connection) return;   // not de-duplicating: nothing to remember
+
     AcquireSRWLockExclusive(&lock);
 
     // Use the running counter instead of re-walking the whole list on every add.
@@ -502,4 +699,47 @@ void clear_logged_connections(void)
     g_logged_count = 0;
 
     ReleaseSRWLockExclusive(&lock);
+}
+
+// ---- "Log every connection" ----
+// Off (default): the Connections log shows a connection once per (process, destination, port, action), see
+// is_connection_already_logged(). On: every new TCP connection is logged (the caller asks only on the SYN), and a UDP
+// flow - identified by process, local port, destination and action - is logged once, and again only after it has been
+// silent for 30 s, so a busy UDP flow or a blocked sender does not flood the log.
+volatile BOOL g_log_every_connection = FALSE;
+
+#define UDP_LOGFLOW_SIZE     512
+#define UDP_LOGFLOW_QUIET_MS 30000
+typedef struct { BOOL used; DWORD pid; UINT32 dkey; UINT16 sport, dport; UINT8 action; ULONGLONG t; } UDP_LOGFLOW;
+static UDP_LOGFLOW g_udp_logflow[UDP_LOGFLOW_SIZE];
+
+BOOL connection_log_wanted(DWORD pid, UINT32 dest_key, UINT16 dest_port, UINT16 src_port, BOOL is_udp, RuleAction action)
+{
+    if (!g_log_every_connection)
+        return !is_connection_already_logged(pid, dest_key, dest_port, action);
+    if (!is_udp)
+        return TRUE;
+
+    ULONGLONG now = GetTickCount64();
+    BOOL want = TRUE;
+    int slot = -1, oldest = 0;
+    AcquireSRWLockExclusive(&lock);
+    for (int i = 0; i < UDP_LOGFLOW_SIZE; i++)
+    {
+        UDP_LOGFLOW *f = &g_udp_logflow[i];
+        if (!f->used) { if (slot < 0) slot = i; continue; }
+        if (f->pid == pid && f->dkey == dest_key && f->sport == src_port && f->dport == dest_port && f->action == (UINT8)action)
+        {
+            want = (now - f->t) >= UDP_LOGFLOW_QUIET_MS;     // same flow: only after a quiet period
+            f->t = now;
+            ReleaseSRWLockExclusive(&lock);
+            return want;
+        }
+        if (f->t < g_udp_logflow[oldest].t) oldest = i;
+    }
+    if (slot < 0) slot = oldest;                              // table full: recycle the longest-silent flow
+    UDP_LOGFLOW *n = &g_udp_logflow[slot];
+    n->used = TRUE; n->pid = pid; n->dkey = dest_key; n->sport = src_port; n->dport = dest_port; n->action = (UINT8)action; n->t = now;
+    ReleaseSRWLockExclusive(&lock);
+    return want;
 }

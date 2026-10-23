@@ -1,5 +1,5 @@
 !define PRODUCT_NAME "ProxyBridge"
-!define PRODUCT_VERSION "4.0.13-Beta"
+!define PRODUCT_VERSION "4.3.0"
 !define PRODUCT_PUBLISHER "InterceptSuite"
 !define PRODUCT_WEB_SITE "https://github.com/InterceptSuite/ProxyBridge"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
@@ -8,7 +8,7 @@
 Unicode True
 
 ; Version Information
-VIProductVersion "4.0.13.0"
+VIProductVersion "4.3.0.0"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "ProductVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey "CompanyName" "${PRODUCT_PUBLISHER}"
@@ -38,7 +38,11 @@ RequestExecutionLevel admin
 !insertmacro MUI_PAGE_INSTFILES
 
 ; Finish page offers to launch ProxyBridge - checkbox is checked by default.
-!define MUI_FINISHPAGE_RUN "$INSTDIR\ProxyBridge.exe"
+; The installer runs elevated, and a program it starts directly would inherit administrator rights. ProxyBridge is
+; meant to run as a normal user (the engine service does the privileged work), so launch it through Explorer, which
+; starts it with the signed-in user's normal rights.
+!define MUI_FINISHPAGE_RUN
+!define MUI_FINISHPAGE_RUN_FUNCTION LaunchAppAsUser
 !define MUI_FINISHPAGE_RUN_TEXT "Run ProxyBridge now"
 !insertmacro MUI_PAGE_FINISH
 
@@ -46,6 +50,10 @@ RequestExecutionLevel admin
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "English"
+
+Function LaunchAppAsUser
+  Exec '"$WINDIR\explorer.exe" "$INSTDIR\ProxyBridge.exe"'
+FunctionEnd
 
 Section "MainSection" SEC01
   ; A running ProxyBridge locks the files we need to overwrite. Detect it and ask
@@ -63,6 +71,12 @@ Section "MainSection" SEC01
       Sleep 1500
   install_proceed:
 
+  ; Stop the engine service first (it holds ProxyBridgeCore.dll / WinDivert64.sys open), then
+  ; remove the legacy elevated logon task older versions created.
+  nsExec::ExecToLog 'sc stop ProxyBridgeSvc'
+  Sleep 1500
+  nsExec::ExecToLog 'schtasks /Delete /F /TN "ProxyBridge"'
+
   ; Stop and unload the WinDivert driver so WinDivert64.sys can be replaced.
   nsExec::ExecToLog 'sc stop WinDivert'
   nsExec::ExecToLog 'sc delete WinDivert'
@@ -77,14 +91,35 @@ Section "MainSection" SEC01
   File "..\output\ProxyBridge.exe"
   File "..\output\ProxyBridge_CLI.exe"
   File "..\output\ProxyBridgeCore.dll"
+  File "..\output\ProxyBridgeSvc.exe"
   File "..\output\WinDivert.dll"
   File "..\output\WinDivert64.sys"
+
+  ; The service runs as SYSTEM from this folder, so ordinary users must never be able to modify it
+  ; (a folder chosen outside Program Files, e.g. D:\Tools, is usually writable by every user).
+  ; SYSTEM and Administrators: full control; Users: read/execute. SIDs, so it works on any language.
+  nsExec::ExecToLog 'icacls "$INSTDIR" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"'
 
   ; Remove leftover native libraries from the old C#/Avalonia GUI. The native C GUI
   ; does not use them; without this an upgrade would keep these stale DLLs behind.
   Delete "$INSTDIR\av_libglesv2.dll"
   Delete "$INSTDIR\libHarfBuzzSharp.dll"
   Delete "$INSTDIR\libSkiaSharp.dll"
+
+  ; Register the engine service once. It runs as LocalSystem and starts with Windows, so the
+  ; ProxyBridge app itself never needs administrator rights. The service ACL lets interactive
+  ; users start it (never stop or reconfigure it), in case it was stopped.
+  nsExec::ExecToLog 'sc delete ProxyBridgeSvc'
+  ; Remove the inbound firewall rules the engine added for its relay (one per executable).
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridgeSvc.exe"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridge.exe"'
+  nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridge_CLI.exe"'
+  nsExec::ExecToLog 'sc create ProxyBridgeSvc binPath= "\"$INSTDIR\ProxyBridgeSvc.exe\"" start= auto DisplayName= "ProxyBridge Service"'
+  nsExec::ExecToLog 'sc description ProxyBridgeSvc "Privileged traffic-redirection engine for ProxyBridge. Lets the ProxyBridge app run without administrator rights."'
+  nsExec::ExecToLog 'sc sdset ProxyBridgeSvc "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"'
+  ; Local group that may drive the service; the signed-in user is added to it.
+  nsExec::ExecToLog '"$INSTDIR\ProxyBridgeSvc.exe" --setup-users'
+  nsExec::ExecToLog 'sc start ProxyBridgeSvc'
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\ProxyBridge.exe"
@@ -124,8 +159,17 @@ Section Uninstall
       Sleep 1500
   uninst_proceed:
 
-  ; Remove the "Run at Startup" logon task the GUI may have created.
+  ; Remove the engine service, and the legacy "Run at Startup" logon task older versions created.
+  nsExec::ExecToLog 'sc stop ProxyBridgeSvc'
+  Sleep 1500
+  nsExec::ExecToLog 'sc delete ProxyBridgeSvc'
+  nsExec::ExecToLog 'net localgroup "ProxyBridge Users" /delete'
+  DeleteRegKey HKLM "SOFTWARE\ProxyBridge\AllowedSids"
+  DeleteRegKey /ifempty HKLM "SOFTWARE\ProxyBridge"
   nsExec::ExecToLog 'schtasks /Delete /F /TN "ProxyBridge"'
+  ; The per-user Run entry is removed for the account running the uninstaller; other users'
+  ; entries just point at a missing exe and are harmless.
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "ProxyBridge"
 
   ; Stop the WinDivert driver first so WinDivert64.sys isn't held open.
   nsExec::ExecToLog 'sc stop WinDivert'
@@ -136,6 +180,7 @@ Section Uninstall
   Delete "$INSTDIR\ProxyBridge.exe"
   Delete "$INSTDIR\ProxyBridge_CLI.exe"
   Delete "$INSTDIR\ProxyBridgeCore.dll"
+  Delete "$INSTDIR\ProxyBridgeSvc.exe"
   Delete "$INSTDIR\WinDivert.dll"
   Delete "$INSTDIR\WinDivert64.sys"
   Delete "$INSTDIR\uninst.exe"

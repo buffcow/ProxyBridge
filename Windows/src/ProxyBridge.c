@@ -35,6 +35,7 @@ volatile BOOL g_has_active_rules = FALSE;
 // Set when at least one enabled rule carries a domain filter. Gates the DNS-cache
 // lookup in match_rule so setups without domain rules pay zero extra cost.
 volatile BOOL g_has_domain_rules = FALSE;
+volatile BOOL g_proxy_enabled = TRUE;
 SOCKET udp_relay_socket = INVALID_SOCKET;
 SOCKET udp_relay_socket6 = INVALID_SOCKET;
 volatile BOOL running = FALSE;
@@ -72,12 +73,90 @@ volatile LONG port_decided_bitmap[2][2048] = {{0}};
 volatile LONG port_direct_bitmap[2][2048]  = {{0}};
 
 UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
-BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 LogCallback g_log_callback = NULL;
 ConnectionCallback g_connection_callback = NULL;
 
 char  *g_pidtbl_buf = NULL;
 DWORD  g_pidtbl_cap = 0;
+
+// A fresh outbound SYN (SYN, no ACK) is a brand-new connection, so whatever we remember for
+// its source port belongs to an earlier one. Clean closes are cleared on FIN/RST, but many
+// connections end without an outbound FIN/RST (peer reset, connect timeout, app killed), and
+// Windows later reuses that ephemeral port. Without this the old decision survives until the
+// 30-minute sweep: a stale DIRECT bit lets the new connection bypass the proxy, and a stale
+// tracking entry redirects it to the previous connection's destination. The result is a proxy
+// that works at first and degrades over hours as the port range cycles. A retransmitted SYN
+// for a live connection just gets re-evaluated and re-tracked with the same answer.
+// TRUE if dst is one of the configured proxy servers (IPv4). The relay's own upstream sockets
+// are ordinary outbound connections to that address and draw their local port from the same
+// ephemeral pool as the apps. If such a port matches a leftover tracking entry or DIRECT bit of
+// an earlier app flow, the relay's own connection to the proxy gets redirected back into the
+// relay (or mis-decided) - proxied apps then hang while the log still looks normal, and it
+// gets likelier the longer the ephemeral range has been cycling. Traffic to the proxy server
+// itself must never be redirected, so it is passed through before any per-port state is used.
+static BOOL is_proxy_server_endpoint(UINT32 dst_ip, UINT16 dst_port)
+{
+    int n = g_proxy_config_count;
+    if (n > MAX_PROXY_CONFIGS) n = MAX_PROXY_CONFIGS;
+    for (int i = 0; i < n; i++)
+    {
+        const PROXY_CONFIG *c = &g_proxy_configs[i];
+        if (c->config_id != 0 && c->port == dst_port && c->resolved_ip == dst_ip)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+// UDP counterpart: the datagrams between the relay and the proxy's UDP relay (SOCKS5 UDP
+// ASSOCIATE) in either direction. The relay's send socket draws its local port from the same
+// pool as the apps, so without this a port collision with a tracked app flow redirects the
+// relay's own packets back into the relay and breaks all proxied UDP until restart.
+static BOOL is_proxy_udp_endpoint(UINT32 ip, UINT16 port_host)
+{
+    int n = g_proxy_config_count;
+    if (n > MAX_PROXY_CONFIGS) n = MAX_PROXY_CONFIGS;
+    for (int i = 0; i < n; i++)
+    {
+        const PROXY_CONFIG *c = &g_proxy_configs[i];
+        if (c->config_id != 0 && c->udp_connected &&
+            c->udp_relay_addr.sin_addr.s_addr == ip && ntohs(c->udp_relay_addr.sin_port) == port_host)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void reset_stale_tcp_state(UINT16 sp, BOOL is_ipv6)
+{
+    if (sp == g_local_relay_port) return;   // never our own relay's port
+    if (port_is_decided(sp, is_ipv6) || is_connection_tracked(sp, FALSE, is_ipv6))
+    {
+        remove_connection(sp, FALSE, is_ipv6);
+        port_clear(sp, is_ipv6);
+    }
+}
+
+// Re-injection wrapper. Every WinDivertSend() in the packet loop used to ignore its result, so a
+// failed injection dropped the packet without a trace and the sender only noticed on its next
+// retransmission (~1 s later). Failures are now counted and logged (first few, then rarely).
+static volatile LONG g_send_fail = 0;
+static BOOL pb_divert_send(HANDLE h, PVOID pkt, UINT len, const WINDIVERT_ADDRESS *addr)
+{
+    if (WinDivertSend(h, pkt, len, NULL, addr))
+        return TRUE;
+    DWORD err = GetLastError();
+    LONG n = InterlockedIncrement(&g_send_fail);
+    if (n <= 10 || n % 500 == 0)
+    {
+        PWINDIVERT_IPHDR ip4 = NULL; PWINDIVERT_IPV6HDR ip6 = NULL; PWINDIVERT_TCPHDR t = NULL; PWINDIVERT_UDPHDR u = NULL;
+        WinDivertHelperParsePacket(pkt, len, &ip4, &ip6, NULL, NULL, NULL, &t, &u, NULL, NULL, NULL, NULL);
+        log_message("WinDivertSend failed (error %lu, %ld total): %s %s %u bytes%s%s%s",
+                    err, n, ip4 ? "IPv4" : ip6 ? "IPv6" : "?", t ? "TCP" : u ? "UDP" : "?", len,
+                    addr->Outbound ? " outbound" : " inbound", addr->Loopback ? " loopback" : "",
+                    (t && t->Syn) ? " SYN" : (t && t->Fin) ? " FIN" : (t && t->Rst) ? " RST" : "");
+    }
+    return FALSE;
+}
+#define WinDivertSend(h, p, l, s, a) pb_divert_send((h), (p), (l), (a))
 
 DWORD WINAPI packet_processor(LPVOID arg)
 {
@@ -87,16 +166,31 @@ DWORD WINAPI packet_processor(LPVOID arg)
     PWINDIVERT_IPHDR ip_header;
     PWINDIVERT_TCPHDR tcp_header;
     PWINDIVERT_UDPHDR udp_header;
+    DWORD recv_fail_streak = 0;
 
     while (running)
     {
         if (!WinDivertRecv(windivert_handle, packet, sizeof(packet), &packet_len, &addr))
         {
-            if (GetLastError() == ERROR_INVALID_HANDLE)
+            DWORD err = GetLastError();
+            // Handle closed / shut down (ProxyBridge_Stop) - leave quietly.
+            if (!running || err == ERROR_INVALID_HANDLE || err == ERROR_NO_DATA || err == ERROR_OPERATION_ABORTED)
                 break;
-            log_message("Failed to receive packet (%lu)", GetLastError());
+
+            // Anything else: skip the bad packet, but don't spin or flood the log if the error
+            // is persistent. Log the first failure and then once per 1000, back off while it
+            // keeps failing, and say so loudly if capture is effectively dead - otherwise the
+            // app looks "running" while nothing is being proxied.
+            recv_fail_streak++;
+            if (recv_fail_streak == 1 || recv_fail_streak % 1000 == 0)
+                log_message("Failed to receive packet (%lu), %lu consecutive failures", err, recv_fail_streak);
+            if (recv_fail_streak == 5000)
+                log_message("Packet capture keeps failing (%lu) - traffic is not being redirected. Restart ProxyBridge.", err);
+            if (recv_fail_streak > 10)
+                Sleep(recv_fail_streak > 1000 ? 100 : 5);
             continue;
         }
+        recv_fail_streak = 0;
 
         PWINDIVERT_IPV6HDR ipv6_header = NULL;
         WinDivertHelperParsePacket(packet, packet_len, &ip_header, &ipv6_header, NULL,
@@ -119,7 +213,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     {
                         UINT16 client_sp = ntohs(udp_header->DstPort);
                         UINT8  orig_dst6[16]; UINT16 orig_dp = 0; UINT32 dummy = 0;
-                        if (get_connection_full_v6(client_sp, TRUE, orig_dst6, &orig_dp, &dummy, NULL))
+                        if (get_connection_full_v6(client_sp, TRUE, orig_dst6, &orig_dp, &dummy))
                         {
                             memcpy(ipv6_header->SrcAddr, orig_dst6, 16);
                             udp_header->SrcPort = htons(orig_dp);
@@ -133,7 +227,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         goto ipv6u_send;
                     }
 
-                    if (is_connection_tracked(sp, TRUE, TRUE))
+                    if (udp_flow_validate(sp, TRUE, 0, (const UINT8*)ipv6_header->DstAddr, dp))
                     {
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
                         static const UINT8 _lb6u2[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -161,12 +255,20 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         continue;
                     }
 
+                    if (udp_direct_cached(TRUE, ipv6_header->DstAddr, sp, dp))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
                     RuleAction action6u;
                     DWORD pid6u = 0;
                     UINT32 pcid6u = 0;
                     action6u = check_process_rule_v6((const UINT8*)ipv6_header->SrcAddr, sp, (const UINT8*)ipv6_header->DstAddr, dp, TRUE, &pid6u, &pcid6u);
+                    if (action6u == RULE_ACTION_DIRECT && pid6u > 0)
+                        udp_direct_remember(TRUE, ipv6_header->DstAddr, sp, dp);
 
-                    if (action6u == RULE_ACTION_PROXY && !g_localhost_via_proxy)
+                    if (action6u == RULE_ACTION_PROXY && !g_tl_rule_localhost)
                     {
                         const UINT8 *d6=(const UINT8*)ipv6_header->DstAddr;
                         static const UINT8 lb6[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -191,7 +293,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         char pname[MAX_PROCESS_NAME];
                         if (get_process_name_from_pid(pid6u, pname, sizeof(pname)))
                         {
-                            if (!is_connection_already_logged(pid6u, v6key, dp, action6u))
+                            if (connection_log_wanted(pid6u, v6key, dp, sp, TRUE, action6u))
                             {
                                 char dstr[64];
                                 inet_ntop(AF_INET6, ipv6_header->DstAddr, dstr, sizeof(dstr));
@@ -215,7 +317,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                             // HTTP proxy can't relay UDP - drop
                             continue;
                         }
-                        add_connection_v6(sp, TRUE, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, pcid6u);
+                        add_connection_v6(sp, TRUE, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, pcid6u, pid6u, g_tl_rule_id);
 
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
                         static const UINT8 _lb6up[16]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -279,12 +381,13 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 UINT16 dp = ntohs(tcp_header->DstPort);
 
                 if (tcp_header->Syn && !tcp_header->Ack)
-                    port_clear(sp, TRUE);
+                    reset_stale_tcp_state(sp, TRUE);
 
                 if (port_is_decided(sp, TRUE))
                 {
-                    if (tcp_header->Rst) port_clear(sp, TRUE);
-                    if (port_is_direct(sp, TRUE))
+                    BOOL was_direct = port_is_direct(sp, TRUE);   // remember before clearing on FIN/RST
+                    if (tcp_header->Fin || tcp_header->Rst) port_clear(sp, TRUE);
+                    if (was_direct)
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
@@ -298,7 +401,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     UINT8  orig_dst6[16];
                     UINT16 orig_dst_port = 0;
                     UINT32 dummy_cfg = 0;
-                    get_connection_full_v6(client_sp, FALSE, orig_dst6, &orig_dst_port, &dummy_cfg, NULL);
+                    get_connection_full_v6(client_sp, FALSE, orig_dst6, &orig_dst_port, &dummy_cfg);
                     if (orig_dst_port) tcp_header->SrcPort = htons(orig_dst_port);
 
                     static const UINT8 _lb6[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -312,12 +415,15 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         memcpy(ipv6_header->SrcAddr, tmp, 16);
                         addr.Outbound = FALSE;
                     }
+                    if (tcp_header->Rst) remove_connection(client_sp, FALSE, TRUE);
+                    else if (tcp_header->Fin) connection_fin(client_sp, TRUE, 2);
                     goto ipv6_send;
                 }
 
                 if (is_connection_tracked(sp, FALSE, TRUE))
                 {
-                    if (tcp_header->Rst) port_clear(sp, TRUE);
+                    if (tcp_header->Rst) { remove_connection(sp, FALSE, TRUE); port_clear(sp, TRUE); }
+                    else if (tcp_header->Fin) connection_fin(sp, TRUE, 1);
                     tcp_header->DstPort = htons(g_local_relay_port);
 
                     static const UINT8 _lb6t[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
@@ -332,6 +438,13 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         addr.Outbound = FALSE;
                     }
                     goto ipv6_send;
+                }
+
+                // Teardown of an untracked flow: nothing to decide (see the IPv4 path).
+                if (tcp_header->Fin || tcp_header->Rst)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
                 }
 
                 // skip multicast/link-local
@@ -356,8 +469,8 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 if (decision_ms6 >= SLOW_PACKET_DECISION_MS)
                     log_message("[PACKET TIMING] IPv6 TCP rule lookup port=%u took %llums", sp, decision_ms6);
 
-                // ::1 IPv6 loopback - use  same "Localhost via Proxy" toggle as IPv4 127.
-                if (action6 == RULE_ACTION_PROXY && !g_localhost_via_proxy)
+                // ::1 IPv6 loopback - same per-rule "localhost via proxy" flag as IPv4 127.
+                if (action6 == RULE_ACTION_PROXY && !g_tl_rule_localhost)
                 {
                     const UINT8 *dst6 = (const UINT8*)ipv6_header->DstAddr;
                     // check for ::1 (loopback) or ::ffff:127.x.x.x (v4-mapped loopback)
@@ -379,7 +492,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     char process_name[MAX_PROCESS_NAME];
                     if (get_process_name_from_pid(pid6, process_name, sizeof(process_name)))
                     {
-                        if (!is_connection_already_logged(pid6, v6key, dp, action6))
+                        if (connection_log_wanted(pid6, v6key, dp, sp, FALSE, action6))
                         {
                             char dest_ip_str[64];
                             const UINT8 *d6 = (const UINT8*)ipv6_header->DstAddr;
@@ -423,7 +536,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 }
                 else if (action6 == RULE_ACTION_PROXY)
                 {
-                    add_connection_v6(sp, FALSE, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, proxy_config_id6);
+                    add_connection_v6(sp, FALSE, (const UINT8*)ipv6_header->SrcAddr, (const UINT8*)ipv6_header->DstAddr, dp, proxy_config_id6, pid6, g_tl_rule_id);
                     port_set_decided(sp, TRUE);
                     tcp_header->DstPort = htons(g_local_relay_port);
 
@@ -492,7 +605,14 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         continue;
                     }
                 }
-                else if (is_connection_tracked(ntohs(udp_header->SrcPort), TRUE, FALSE))
+                else if (is_proxy_udp_endpoint(ip_header->DstAddr, ntohs(udp_header->DstPort)) ||
+                         is_proxy_udp_endpoint(ip_header->SrcAddr, ntohs(udp_header->SrcPort)))
+                {
+                    // relay <-> proxy UDP relay traffic: never redirect or evaluate
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+                else if (udp_flow_validate(ntohs(udp_header->SrcPort), FALSE, ip_header->DstAddr, NULL, ntohs(udp_header->DstPort)))
                 {
                     UINT16 src_port = ntohs(udp_header->SrcPort);
                     udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
@@ -526,15 +646,24 @@ DWORD WINAPI packet_processor(LPVOID arg)
                         continue;
                     }
 
+                    // Known DIRECT flow (decided within the last few seconds): skip the lookup.
+                    if (udp_direct_cached(FALSE, &dest_ip, src_port, dest_port))
+                    {
+                        WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                        continue;
+                    }
+
                     RuleAction action;
                     DWORD pid = 0;
                     UINT32 proxy_config_id = 0;
 
                     action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid, &proxy_config_id);
+                    if (action == RULE_ACTION_DIRECT && pid > 0)
+                        udp_direct_remember(FALSE, &dest_ip, src_port, dest_port);
 
-                    // override PROXY to DIRECT if localhost proxy is disabled and destination is localhost
+                    // override PROXY to DIRECT when the matched rule does not allow localhost and the destination is localhost
                     BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
-                    if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && dest_first_octet == 127)
+                    if (action == RULE_ACTION_PROXY && !g_tl_rule_localhost && dest_first_octet == 127)
                         action = RULE_ACTION_DIRECT;
 
                     // Override PROXY to DIRECT for critical IPs and ports
@@ -554,7 +683,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
 
                         if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
                         {
-                            if (!is_connection_already_logged(pid, dest_ip, dest_port, action))
+                            if (connection_log_wanted(pid, dest_ip, dest_port, src_port, TRUE, action))
                             {
                                 char dest_ip_str[32];
                                 format_ip_address(dest_ip, dest_ip_str, sizeof(dest_ip_str));
@@ -597,7 +726,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
 
                     if (action == RULE_ACTION_PROXY)
                     {
-                        add_connection(src_port, TRUE, src_ip, dest_ip, dest_port, proxy_config_id);
+                        add_connection(src_port, TRUE, src_ip, dest_ip, dest_port, proxy_config_id, pid, g_tl_rule_id);
 
                         // redirect to UDP relay server at 127.0.0.1:34011
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
@@ -665,11 +794,19 @@ DWORD WINAPI packet_processor(LPVOID arg)
             // Once check_process_rule() has run for a source port and decided DIRECT,
             // every subsequent packet from that port takes this branch one bitmap
             // read 5 cycle + WinDivertSend, with zero kernel calls
-            // RST clears immediately; a fresh SYN resets recycled-port state.
-            // FIN keeps the mapping for the remaining half-close ACK/response path.
+            // FIN/RST clears the decision; a fresh SYN resets recycled-port state.
+            // An active relay keeps its mapping until its worker or IOCP cleanup finishes.
             // Part of this taken from Cluade to fix windivert packet error
             {
                 UINT16 sp = ntohs(tcp_header->SrcPort);
+
+                // Traffic to the proxy server itself (the relay's upstream sockets): never touch.
+                if (sp != g_local_relay_port &&
+                    is_proxy_server_endpoint(ip_header->DstAddr, ntohs(tcp_header->DstPort)))
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
 
                 // A fresh SYN starts a new connection that may be reusing an ephemeral
                 // port whose previous owner has closed. Evict any PID cached for this
@@ -678,15 +815,19 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 // up to PID_CACHE_TTL_MS after a port is recycled).
                 if (tcp_header->Syn && !tcp_header->Ack)
                 {
-                    port_clear(sp, FALSE);
                     remove_cached_pid(ip_header->SrcAddr, sp, FALSE);
+                    reset_stale_tcp_state(sp, FALSE);
                 }
 
                 if (port_is_decided(sp, FALSE))
                 {
-                    if (tcp_header->Rst)
+                    // A FIN/RST on a DIRECT flow ends that decision: clear it and send the packet
+                    // untouched. (Clearing first and then testing "is it direct?" used to fall through
+                    // to a fresh rule lookup that cached DIRECT again, so teardown never evicted anything.)
+                    BOOL was_direct = port_is_direct(sp, FALSE);
+                    if (tcp_header->Fin || tcp_header->Rst)
                         port_clear(sp, FALSE);
-                    if (port_is_direct(sp, FALSE))
+                    if (was_direct)
                     {
                         WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
                         continue;
@@ -718,6 +859,10 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     addr.Outbound = FALSE;
                 }
 
+                if (tcp_header->Rst)
+                    remove_connection(dst_port, FALSE, FALSE);
+                else if (tcp_header->Fin)
+                    connection_fin(dst_port, FALSE, 2);
             }
             else if (is_connection_tracked(ntohs(tcp_header->SrcPort), FALSE, FALSE))
             {
@@ -725,8 +870,11 @@ DWORD WINAPI packet_processor(LPVOID arg)
 
                 if (tcp_header->Rst)
                 {
+                    remove_connection(src_port, FALSE, FALSE);
                     port_clear(src_port, FALSE);
                 }
+                else if (tcp_header->Fin)
+                    connection_fin(src_port, FALSE, 1);
 
                 tcp_header->DstPort = htons(g_local_relay_port);
 
@@ -750,6 +898,15 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 UINT32 orig_dest_ip = ip_header->DstAddr;
                 UINT16 orig_dest_port = ntohs(tcp_header->DstPort);
 
+                // Teardown of a flow we are not tracking: a connection cannot start with FIN/RST, so
+                // there is nothing to decide - and the owner is usually already gone, which made this
+                // an expensive lookup that also re-cached a stale DIRECT verdict for the port.
+                if (tcp_header->Fin || tcp_header->Rst)
+                {
+                    WinDivertSend(windivert_handle, packet, packet_len, NULL, &addr);
+                    continue;
+                }
+
                 // avoid rule pocess and packet process if no rules
                 if (!g_has_active_rules && g_connection_callback == NULL)
                 {
@@ -768,7 +925,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     log_message("[PACKET TIMING] IPv4 TCP rule lookup port=%u took %llums", src_port, decision_ms);
 
                 BYTE orig_dest_first_octet = (orig_dest_ip >> 0) & 0xFF;
-                if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && orig_dest_first_octet == 127)
+                if (action == RULE_ACTION_PROXY && !g_tl_rule_localhost && orig_dest_first_octet == 127)
                     action = RULE_ACTION_DIRECT;
 
                 // Override PROXY to DIRECT for criticl ips
@@ -781,7 +938,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                     char process_name[MAX_PROCESS_NAME];
                     if (pid > 0 && get_process_name_from_pid(pid, process_name, sizeof(process_name)))
                     {
-                        if (!is_connection_already_logged(pid, orig_dest_ip, orig_dest_port, action))
+                        if (connection_log_wanted(pid, orig_dest_ip, orig_dest_port, src_port, FALSE, action))
                         {
                             char dest_ip_str[32];
                             snprintf(dest_ip_str, sizeof(dest_ip_str), "%d.%d.%d.%d",
@@ -836,7 +993,7 @@ DWORD WINAPI packet_processor(LPVOID arg)
                 }
                 else if (action == RULE_ACTION_PROXY)
             {
-                add_connection(src_port, FALSE, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id);
+                add_connection(src_port, FALSE, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id, pid, g_tl_rule_id);
                 // Mark this port as decided (not direct) so subsequent packets from
                 // the same source port skip the rule check.  The is_connection_tracked
                 // branch above handles the actual per-packet redirect.
@@ -889,10 +1046,74 @@ DWORD WINAPI packet_processor(LPVOID arg)
     return 0;
 }
 
-PROXYBRIDGE_API void ProxyBridge_SetLocalhostViaProxy(BOOL enable)
+// Main on/off switch. FALSE pauses ProxyBridge without stopping the capture driver: every NEW connection is
+// sent directly, and no rule (proxy or block) applies. Connections that are already being proxied keep working
+// until they end. TRUE (the default) applies the rules again.
+// "Log every connection": FALSE (default) shows a connection once per (process, destination, port, action);
+// TRUE logs every new TCP connection and every new UDP flow.
+// Copies at most `cap`-1 bytes of a UTF-8 string, never cutting a multi-byte character in half.
+static void copy_utf8(char *dst, size_t cap, const char *src)
 {
-    g_localhost_via_proxy = enable;
-    log_message("Localhost routing: %s (most proxies block localhost for SSRF prevention)", enable ? "via proxy" : "direct");
+    size_t n = strnlen(src, cap - 1);
+    if (src[n] != '\0')                                           // cut: step back to the start of the character
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+PROXYBRIDGE_API UINT32 ProxyBridge_GetFlows(PB_FLOW *out, UINT32 max)
+{
+    if (out == NULL || max == 0) return 0;
+    if (max > PB_FLOWS_MAX) max = PB_FLOWS_MAX;
+    UINT32 n = relay_flows_snapshot(out, max);
+    if (n < max) n += udp_flows_snapshot(out + n, max - n);
+
+    // Names and hosts are looked up here, after every engine lock was released. Process names come from a small
+    // cache (10 s): resolving one means opening the process (or, for a protected / already exited one, walking the
+    // whole process list), which is pointless to repeat every second for a connection that lives for minutes.
+    static struct { DWORD pid; ULONGLONG tick; char name[40]; } cache[64];
+    static volatile LONG cache_busy = 0;
+    ULONGLONG now = GetTickCount64();
+    BOOL have_cache = InterlockedCompareExchange(&cache_busy, 1, 0) == 0;      // a second caller simply skips the cache
+    for (UINT32 i = 0; i < n; i++)
+    {
+        PB_FLOW *f = &out[i];
+        int slot = (int)(f->pid % 64);
+        if (have_cache && cache[slot].pid == f->pid && cache[slot].tick != 0 && now - cache[slot].tick < 10000)
+            copy_utf8(f->name, sizeof(f->name), cache[slot].name);
+        else
+        {
+            char full[MAX_PROCESS_NAME], nm[40];
+            nm[0] = '\0';
+            if (f->pid != 0 && get_process_name_from_pid(f->pid, full, sizeof(full)))
+                copy_utf8(nm, sizeof(nm), extract_filename(full));
+            copy_utf8(f->name, sizeof(f->name), nm);
+            if (have_cache) { cache[slot].pid = f->pid; cache[slot].tick = now; memcpy(cache[slot].name, nm, sizeof(nm)); }
+        }
+
+        char dom[256]; dom[0] = '\0';
+        BOOL have = f->is_ipv6 ? dns_cache_lookup_v6(f->dest, dom, sizeof(dom)) : dns_cache_lookup(*(UINT32 *)f->dest, dom, sizeof(dom));
+        if (have && dom[0] != '\0' && strlen(dom) < sizeof(f->host)) { strcpy_s(f->host, sizeof(f->host), dom); continue; }
+        if (f->is_ipv6) { struct in6_addr a6; memcpy(&a6, f->dest, 16); if (!inet_ntop(AF_INET6, &a6, f->host, sizeof(f->host))) f->host[0] = '\0'; }
+        else format_ip_address(*(UINT32 *)f->dest, f->host, sizeof(f->host));
+    }
+    if (have_cache) InterlockedExchange(&cache_busy, 0);
+    return n;
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetLogEveryConnection(BOOL enable)
+{
+    g_log_every_connection = enable ? TRUE : FALSE;
+    clear_logged_connections();
+}
+
+PROXYBRIDGE_API void ProxyBridge_SetEnabled(BOOL enable)
+{
+    BOOL was = g_proxy_enabled;
+    g_proxy_enabled = enable ? TRUE : FALSE;
+    if (was != g_proxy_enabled)
+        log_message(enable ? "ProxyBridge enabled: rules apply to new connections"
+                           : "ProxyBridge paused: new connections go direct (connections already proxied continue)");
 }
 
 PROXYBRIDGE_API void ProxyBridge_SetLogCallback(LogCallback callback)
@@ -925,7 +1146,9 @@ DWORD WINAPI cleanup_worker(LPVOID arg)
 {
     while (running)
     {
-        Sleep(30000);  // 30 seconds
+        // 30 seconds, but in short slices: ProxyBridge_Stop() only waits briefly for this thread, and a
+        // thread still sleeping inside the DLL when it is unloaded would crash the host process.
+        for (int i = 0; i < 300 && running; i++) Sleep(100);
         if (running)
         {
             cleanup_stale_connections();
@@ -933,6 +1156,71 @@ DWORD WINAPI cleanup_worker(LPVOID arg)
             cleanup_stale_dns_cache();
         }
     }
+    return 0;
+}
+
+
+// Windows Firewall rule for the relay.
+//
+// Redirected connections reach the relay as *inbound* traffic on whichever interface the app used.
+// Windows only prompts to allow an app on the Private profile by default, so on an adapter that is
+// classified Public (VPN tunnels such as WireGuard/OpenVPN nearly always are) the firewall dropped
+// the redirected SYN: the Connections log looked normal, but the app timed out and the proxy never
+// saw it. Add an inbound allow rule for this executable on all profiles (the relay now verifies the
+// peer address, so this does not open it up to other hosts). Needs elevation; best effort.
+static DWORD fw_run(const wchar_t *args, DWORD wait_ms)
+{
+    wchar_t cmd[1400];
+    _snwprintf_s(cmd, 1400, _TRUNCATE, L"netsh.exe advfirewall firewall %s", args);
+    STARTUPINFOW si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return (DWORD)-1;
+    DWORD code = (DWORD)-1;
+    if (WaitForSingleObject(pi.hProcess, wait_ms) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return code;
+}
+
+static HANDLE g_fw_thread = NULL;
+
+static DWORD WINAPI fw_ensure_thread(LPVOID arg)
+{
+    (void)arg;
+    BOOL elevated = FALSE; HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+    {
+        TOKEN_ELEVATION te; DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &n)) elevated = te.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    if (!elevated) return 0;
+
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+
+    // One rule per executable path; the name carries a hash of the (lower-cased) path.
+    unsigned h = 2166136261u;
+    for (const wchar_t *p = exe; *p; p++) { wchar_t c = *p; if (c >= L'A' && c <= L'Z') c += 32; h = (h ^ (unsigned)c) * 16777619u; }
+    wchar_t name[96];
+    _snwprintf_s(name, 96, _TRUNCATE, L"ProxyBridge relay %08x", h);
+
+    wchar_t args[1300];
+    _snwprintf_s(args, 1300, _TRUNCATE, L"show rule name=\"%s\"", name);
+    if (fw_run(args, 8000) == 0) return 0;             // exit code 0 = the rule already exists
+
+    _snwprintf_s(args, 1300, _TRUNCATE,
+        L"add rule name=\"%s\" dir=in action=allow program=\"%s\" enable=yes profile=any "
+        L"description=\"Lets ProxyBridge's local relay receive redirected connections on every network profile (VPN adapters are Public).\"",
+        name, exe);
+    if (fw_run(args, 15000) == 0)
+        log_message("Windows Firewall: added an inbound allow rule for %ls on all network profiles "
+                    "(needed for VPN and Public networks)", exe);
+    else
+        log_message("Windows Firewall: could not add the inbound rule for the relay. If proxying stops working on a "
+                    "VPN or Public network, allow %ls through the firewall for all profiles.", exe);
     return 0;
 }
 
@@ -946,6 +1234,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     InitializeSRWLock(&lock);
     dns_cache_init();
+    udp_direct_reset();
 
     // If domain rules were configured before start, flush the OS DNS cache so the very
     // first connections re-resolve on the wire and populate our IP->hostname snoop cache.
@@ -953,6 +1242,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         flush_dns_resolver_cache();
 
     running = TRUE;
+
+    relay_pool_start();   // optional: connections fall back to blocking relay threads without it
+
+    g_fw_thread = CreateThread(NULL, 0, fw_ensure_thread, NULL, 0, NULL);
 
     proxy_thread = CreateThread(NULL, 1, local_proxy_server, NULL, 0, NULL);
     if (proxy_thread == NULL)
@@ -1045,6 +1338,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         return FALSE;
     }
 
+    // Socket-layer events give the owner PID of each new connection without a table scan.
+    // Optional: if it cannot be opened the lookups fall back to the table.
+    sockmap_start();
+
     // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32–16384).
     // Under heavy upload the kernel enqueues bursts of outbound packets faster
     // than the 4 packet threads can drain them; a full queue drops arriving
@@ -1121,6 +1418,8 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
     running = FALSE;
 
+    sockmap_stop();
+
     if (windivert_handle != INVALID_HANDLE_VALUE)
     {
         WinDivertShutdown(windivert_handle, WINDIVERT_SHUTDOWN_BOTH);
@@ -1133,7 +1432,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     {
         if (packet_thread[i] != NULL)
         {
-            WaitForSingleObject(packet_thread[i], 1000);  // 1 second timeout
+            WaitForSingleObject(packet_thread[i], 8000);  // generous: a thread outliving Stop would run code from an unloaded DLL
             CloseHandle(packet_thread[i]);
             packet_thread[i] = NULL;
         }
@@ -1141,24 +1440,39 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 
     if (proxy_thread != NULL)
     {
-        WaitForSingleObject(proxy_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(proxy_thread, 8000);  // generous: a thread outliving Stop would run code from an unloaded DLL
         CloseHandle(proxy_thread);
         proxy_thread = NULL;
     }
 
     if (cleanup_thread != NULL)
     {
-        WaitForSingleObject(cleanup_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(cleanup_thread, 8000);  // generous: a thread outliving Stop would run code from an unloaded DLL
         CloseHandle(cleanup_thread);
         cleanup_thread = NULL;
     }
 
     if (udp_relay_thread != NULL)
     {
-        WaitForSingleObject(udp_relay_thread, 1000);  // 1 second timeout
+        WaitForSingleObject(udp_relay_thread, 8000);  // generous: a thread outliving Stop would run code from an unloaded DLL
         CloseHandle(udp_relay_thread);
         udp_relay_thread = NULL;
     }
+
+    // Handshake threads (connect to the proxy + SOCKS/HTTP negotiation) can still be mid-flight.
+    for (int i = 0; i < 700 && g_handler_threads > 0; i++) Sleep(50);    // up to 35 s
+    if (g_handler_threads > 0) log_message("Stop: %ld connection thread(s) still running", (long)g_handler_threads);
+
+    if (g_fw_thread != NULL)
+    {
+        WaitForSingleObject(g_fw_thread, 20000);   // netsh calls are bounded (8 s + 15 s)
+        CloseHandle(g_fw_thread);
+        g_fw_thread = NULL;
+    }
+
+    // Close every live relay and stop the pool's worker threads (the accept loop has ended,
+    // so no new relays arrive). Must finish before the engine can be unloaded.
+    relay_pool_stop();
 
     AcquireSRWLockExclusive(&lock);
     for (int i = 0; i < CONNECTION_HASH_SIZE; i++)

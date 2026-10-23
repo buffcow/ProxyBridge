@@ -91,7 +91,8 @@ SOCKET open_connected_proxy_socket(const PROXY_CONFIG *cfg, UINT32 proxy_ip, DWO
         return INVALID_SOCKET;
     }
 
-    configure_tcp_socket(sock, 4194304, PROXY_HANDSHAKE_TIMEOUT_MS);
+    int sockbuf = g_active_relays < 1024 ? 4194304 : 1048576;
+    configure_tcp_socket(sock, sockbuf, PROXY_HANDSHAKE_TIMEOUT_MS);
 
     struct sockaddr_in proxy_addr;
     memset(&proxy_addr, 0, sizeof(proxy_addr));

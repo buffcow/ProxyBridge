@@ -55,7 +55,7 @@ Launch `ProxyBridge.exe` with Administrator privileges for an intuitive graphica
 #### Proxy Settings
 
 <p align="center">
-  <img src="../img/proxy-setting.png" alt="Proxy Settings" width="600"/>
+  <img src="../img/Windows/Proxy-Server.png" alt="Proxy Settings" width="600"/>
 </p>
 
 1. Click **Proxy** tab in the main window
@@ -91,11 +91,7 @@ ProxyBridge supports multiple proxy server configurations simultaneously. Each p
 #### Process Rules
 
 <p align="center">
-  <img src="../img/proxy-rule.png" alt="Add Process Rule" width="600"/>
-</p>
-
-<p align="center">
-  <img src="../img/proxy-rule2.png" alt="Process Rules List" width="600"/>
+  <img src="../img/Windows/Proxy-Rules.png" alt="Process Rules List" width="600"/>
 </p>
 
 1. Click **Proxy** tab in the main window
@@ -113,10 +109,21 @@ ProxyBridge supports multiple proxy server configurations simultaneously. Each p
    - Wildcard IP range: `192.168.*.*`
    - Multiple IPs: `127.0.0.1; 192.168.1.1`
    - IP range: `10.10.1.1-10.10.255.255`
+   - IPv4 CIDR: `10.0.0.0/8`, `192.168.1.128/25`
    - IPv6 exact: `::1`, `2001:db8::1`
    - IPv6 CIDR: `2001:db8::/32`, `fe80::/10`
    - IPv6 range: `2001:db8::1-2001:db8::ff`
+   - Domain names: `github.com`, `*.github.com`
    - Leave empty or use `*` for all hosts
+
+   IP addresses and domain names go in the **same** field and can be mixed: `10.*.*.*; github.com; *.google.com`
+   matches a connection when its IP matches an IP entry **or** its domain matches a domain entry. The box is
+   multiline, so a long list can be written one entry per line; line breaks are only for readability and
+   `;` separates the entries (up to 8191 characters).
+
+   Domain names are learned from the application's own DNS lookups, so they only work with unencrypted DNS
+   (turn off "Secure DNS" / DNS over HTTPS in the browser). In profile files the entries are saved as
+   `TargetHosts` (IPs) and `TargetDomains` (domain names), which other ProxyBridge apps read the same way.
 
    **Target Ports (Optional):**
    - Specific ports: `80; 8080`
@@ -151,7 +158,6 @@ ProxyBridge allows you to export selected rules to a `.pbprofile` JSON file and 
 ```json
 {
   "Version": "1.0",
-  "LocalhostViaProxy": false,
   "IsTrafficLoggingEnabled": true,
   "ProxyConfigs": [
     {
@@ -179,6 +185,7 @@ ProxyBridge allows you to export selected rules to a `.pbprofile` JSON file and 
       "Protocol": "TCP",
       "Action": "PROXY",
       "IsEnabled": true,
+      "LocalhostViaProxy": false,
       "ProxyConfigId": 1
     },
     {
@@ -188,6 +195,7 @@ ProxyBridge allows you to export selected rules to a `.pbprofile` JSON file and 
       "Protocol": "BOTH",
       "Action": "PROXY",
       "IsEnabled": true,
+      "LocalhostViaProxy": false,
       "ProxyConfigId": 2
     }
   ]
@@ -199,13 +207,42 @@ ProxyBridge allows you to export selected rules to a `.pbprofile` JSON file and 
 #### Activity Monitoring
 
 <p align="center">
-  <img src="../img/ProxyBridge.png" alt="Active Connections" width="600"/>
+  <img src="../img/Windows/Connections.png" alt="Active Connections" width="600"/>
+</p>
+
+<p align="center">
+  <img src="../img/Windows/Live%20Connection.png" alt="Live Connections" width="600"/>
 </p>
 
 - View real-time connection activity in the **Connections** tab
+- See what is relayed right now in the **Live Connections** tab: one row per proxied TCP connection or UDP flow with the
+  application, target, time, proxy and bytes sent / received. A finished connection turns grey and stays in the list
+  (with its final byte counts) until you press **Clear closed**; the list keeps up to 1200 rows and replaces the oldest finished
+  one when full. Direct and blocked traffic is not listed (ProxyBridge only sees the first packet of those). The tab polls once
+  a second, and only while it is open.
 - Monitor all TCP and UDP connections system-wide
 - See routing status per connection: **PROXY**, **DIRECT**, or **BLOCK**
 - Search and filter by process name, IP, port, or routing status
+
+**Searching a long rule list:** the **Proxy Rules** window has a search box at the top right. The list shows only
+the rules that contain **every** word you type (case-insensitive) in their name, applications, hosts, ports,
+protocol, action or proxy, for example `chrome github` or `192.168 proxy`. Press **Ctrl+F** to jump to the box,
+just start typing while the list has focus, **Enter** or **Down** to go to the matching rules, and **Esc** (or the
+**x** button) to clear the search. Edit, Clone, Remove and the enable check boxes work on the rules you see;
+Move Up / Move Down are only available when no search is active, because the order of a partial list is ambiguous.
+
+**Pausing ProxyBridge (main switch):** untick **Proxy → Enable ProxyBridge** (or right-click the tray icon and untick
+**Enable ProxyBridge**) to switch every rule off without closing the app. While paused, new connections go out
+directly: proxy rules **and block rules** do not apply, and the window title and tray tooltip show "(PAUSED)".
+Connections that were already being proxied keep working until they end. Tick the item again to apply the rules
+to new connections. ProxyBridge always starts enabled; the switch is not remembered between runs.
+
+**Connections log - one row per connection or per destination:** by default the Connections log shows a connection
+only once for each identical (application, destination IP, destination port, action), which keeps it short: an app
+that opens 50 connections to the same server gets one row. Tick **Settings → Log Every Connection** to log **every new
+TCP connection** and **every new UDP flow** instead (a UDP flow is one local port talking to one destination; it is
+logged again only after 30 seconds of silence, so busy or blocked UDP senders do not flood the log). The setting is
+saved per profile. It only changes what is listed: rules are applied to the same connections either way.
 
 **Note:** Adding a rule with action **PROXY** while no proxy is configured will fall back to a direct connection. Configure at least one proxy server before using PROXY rules.
 
@@ -215,15 +252,15 @@ ProxyBridge allows you to export selected rules to a `.pbprofile` JSON file and 
 
 #### Profile Format
 
-The CLI reads `.pbprofile` files exported directly from the GUI (**File → Export Profile**). These are JSON files containing proxy server configurations and routing rules. See the [Profile JSON Format](#exporting-and-importing-rules) section above for the schema.
+The CLI reads `.pbprofile` files exported directly from the GUI (**Profile → Export Profile**). These are JSON files containing proxy server configurations and routing rules. See the [Profile JSON Format](#exporting-and-importing-rules) section above for the schema.
 
 **Key profile fields read by the CLI:**
 
 | Field | Description |
 |---|---|
-| `ProxyConfigs[]` | Array of proxy servers (SOCKS5 or HTTP, up to 16) |
+| `ProxyConfigs[]` | Array of proxy servers (SOCKS5 or HTTP, up to 32) |
 | `ProxyRules[]` | Array of routing rules (up to 256) |
-| `LocalhostViaProxy` | Whether to route `127.x.x.x` traffic through the proxy |
+| `ProxyRules[].LocalhostViaProxy` | Per rule: also proxy `127.x.x.x` / `::1` traffic that matches this rule (default `false`) |
 | `IsTrafficLoggingEnabled` | Enable/disable connection logging |
 | `ProxyConfigId` | Per-rule proxy assignment (maps to `ProxyConfigs[].Id`) |
 
@@ -263,7 +300,7 @@ ProxyBridge_CLI.exe --help
 
 Options:
   --profile <path>     Path to .pbprofile file exported from the GUI
-                       Export from GUI: File > Export Profile
+                       Export from GUI: Profile > Export Profile
 
   --verbose <0-3>      Logging verbosity
                          0 - Silent (default)
@@ -298,12 +335,12 @@ Commands:
 
 ## Things to Note
 
-- **Localhost Traffic Handling**: Localhost traffic (`127.0.0.0/8` and IPv6 `::1`) requires special handling and is controlled by the **Localhost via Proxy** option in the Proxy menu (disabled by default):
+- **Localhost Traffic Handling**: Localhost traffic (`127.0.0.0/8` and IPv6 `::1`) is handled **per rule** with the **Also proxy localhost traffic** checkbox in the rule editor (off by default):
 
-  **Default Behavior (Localhost via Proxy = Disabled):**
-  - ALL localhost traffic automatically uses direct connection
-  - Proxy rules matching `127.x.x.x` or `::1` addresses are automatically overridden to DIRECT
-  - This is the recommended setting for most users
+  **Default Behavior (checkbox off):**
+  - Connections to localhost that match the rule are sent directly, not through the proxy
+  - Other traffic from the same application still follows the rule as usual
+  - This is the recommended setting for most rules
 
   **Why localhost should stay local:**
   - **Security**: Most proxy servers reject localhost traffic to prevent SSRF (Server-Side Request Forgery) attacks
@@ -314,13 +351,15 @@ Commands:
     - Inter-process communication (IPC) using TCP/UDP on `127.0.0.1`
   - **Routing Issues**: When localhost traffic goes to a remote proxy, the proxy server cannot reach services running on YOUR machine
 
-  **When to Enable Localhost via Proxy:**
+  **When to tick "Also proxy localhost traffic" on a rule:**
   - ✅ Proxy server is running on the same machine (`127.0.0.1:1080`)
-  - ✅ Security testing: Intercepting localhost traffic in Burp Suite/InterceptSuite
+  - ✅ Security testing: Intercepting that application's localhost traffic in Burp Suite/InterceptSuite
   - ✅ Your proxy is configured to handle localhost requests properly
-  - ❌ Do NOT enable if proxy is on a different machine/IP address
+  - ❌ Do NOT tick it if the proxy is on a different machine/IP address
 
-  **CLI:** Controlled via the `LocalhostViaProxy` field in the `.pbprofile` file.
+  Because the setting belongs to the rule, you can proxy localhost traffic for one application (for example your browser) while another (for example `curl.exe`) keeps its local connections direct.
+
+  **CLI / profiles:** Controlled by the `LocalhostViaProxy` field of each rule in the `.pbprofile` file. Older profiles with a single global `LocalhostViaProxy` are still read; that value becomes the default for rules that have no setting of their own.
 
 - **Automatic Direct Routing**: Certain addresses and ports always bypass proxy rules and use direct connection to preserve network stability:
 
@@ -353,7 +392,7 @@ Commands:
   - Many UDP applications use HTTP/3 and DTLS protocols - ensure your proxy handles these
   - **Testing**: Try [Nexus Proxy](https://github.com/InterceptSuite/nexus-proxy) to test ProxyBridge UDP/HTTP3/DTLS support
 
-- **Multiple Proxy Configurations**: Up to 16 proxy server configurations can be active simultaneously. Rules can each be assigned to a specific proxy config. If the assigned config is not found, ProxyBridge falls back to the first available config. This allows routing different apps through different proxies without any application-side configuration.
+- **Multiple Proxy Configurations**: Up to 32 proxy server configurations can be active simultaneously. Rules can each be assigned to a specific proxy config. If the assigned config is not found, ProxyBridge falls back to the first available config. This allows routing different apps through different proxies without any application-side configuration.
 
 ## How It Works
 

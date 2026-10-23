@@ -5,14 +5,15 @@ permissions:
 
 on:
   push:
-    branches: [ master, dev ]
+    branches: [ master, dev, Linux-ebpf ]
   pull_request:
-    branches: [ master, dev ]
+    branches: [ master, dev, Linux-ebpf ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -28,10 +29,24 @@ jobs:
           build-essential \
           gcc \
           make \
-          libnetfilter-queue-dev \
-          libnfnetlink-dev \
+          bzip2 \
+          clang \
+          linux-tools-common \
+          linux-tools-generic \
+          libbpf-dev \
           libgtk-3-dev \
           pkg-config
+      shell: bash
+
+    - name: Locate bpftool
+      # On Ubuntu "bpftool" is only a virtual package; the real binary ships in linux-tools-* and is not on PATH
+      # for the runner's cloud kernel, so find it explicitly.
+      run: |
+        shopt -s nullglob
+        candidates=(/usr/lib/linux-tools/*/bpftool)
+        [ ${#candidates[@]} -gt 0 ] || { echo "bpftool binary not found"; ls /usr/lib/linux-tools 2>&1 || true; exit 1; }
+        echo "BPFTOOL=${candidates[0]}" >> "$GITHUB_ENV"
+        "${candidates[0]}" version | head -1
       shell: bash
 
     - name: Verify dependencies
@@ -48,15 +63,32 @@ jobs:
         echo "=== Checking GTK3 ==="
         pkg-config --modversion gtk+-3.0
         echo ""
-        echo "=== Checking libnetfilter_queue ==="
-        pkg-config --modversion libnetfilter_queue || echo "Package info not available, but headers should be present"
+        echo "=== Checking clang (eBPF compiler) ==="
+        clang --version | head -1
+        echo ""
+        echo "=== Checking bpftool (skeleton generator) ==="
+        "$BPFTOOL" version | head -1
+        echo ""
+        echo "=== Checking libbpf ==="
+        pkg-config --modversion libbpf
+      shell: bash
+
+    - name: Unit tests (rule engine, DNS parser, relay)
+      timeout-minutes: 15
+      run: |
+        Linux/profile/tests/run_tests.sh
+        Linux/gui/tests/run_tests.sh
+        cd Linux/src
+        make test-rules BUILD_DIR="$RUNNER_TEMP/pb-tests"
+        cd tests
+        TMPDIR="$RUNNER_TEMP" ./run_relay_test.sh plain
       shell: bash
 
     - name: Build project
       run: |
         cd Linux
         chmod +x build.sh
-        ./build.sh
+        WERROR=1 ./build.sh
       shell: bash
 
     - name: Verify build output
@@ -84,8 +116,106 @@ jobs:
           echo "✓ GUI built successfully"
           file Linux/output/ProxyBridgeGUI
         else
-          echo "⚠ GUI build skipped (GTK3 not available or build failed)"
+          echo "✗ GUI build failed (GTK3 is installed on this runner)"
+          exit 1
         fi
+      shell: bash
+
+    - name: Smoke test the built binaries
+      run: |
+        cd Linux/output
+        # capture output first: `cmd | grep -q` can fail under pipefail when grep exits early (SIGPIPE)
+        help_out="$(LD_LIBRARY_PATH="$PWD" ./ProxyBridge --help)"
+        grep -q -- "--profile" <<<"$help_out" && echo "✓ CLI runs and shows its help"
+        cli_deps="$(LD_LIBRARY_PATH="$PWD" ldd ./ProxyBridge)"
+        grep -q libproxybridge <<<"$cli_deps" && echo "✓ CLI links libproxybridge.so"
+        # the GUI must carry an $ORIGIN runpath so it finds the library in its own directory
+        gui_dyn="$(readelf -d ./ProxyBridgeGUI)"
+        grep -q 'RUNPATH.*\$ORIGIN' <<<"$gui_dyn" && echo "✓ GUI runpath is \$ORIGIN"
+        # the library must export the public API
+        exports="$(nm -D libproxybridge.so)"
+        for sym in ProxyBridge_Start ProxyBridge_Stop ProxyBridge_AddRule ProxyBridge_AddProxy ProxyBridge_ValidateRule; do
+          grep -q " T $sym" <<<"$exports" || { echo "✗ missing export $sym"; exit 1; }
+        done
+        echo "✓ public API exported"
+        # no iptables/NFQUEUE dependency may come back
+        lib_deps="$(ldd libproxybridge.so)"
+        if grep -qi netfilter <<<"$lib_deps"; then echo "✗ libnetfilter dependency is back"; exit 1; fi
+        echo "✓ no libnetfilter dependency"
+      shell: bash
+
+    - name: Portability - run the binaries on older distributions (issue 146)
+      # BIND_NOW makes the loader resolve every glibc symbol at start-up, so a clean --help run in these images proves the
+      # binaries do not need a newer glibc than Ubuntu 22.04 / Debian 12 / RHEL 9 era systems provide.
+      run: |
+        set -e
+        out="$PWD/Linux/output"
+        # The library and the command line program must run in a bare image with nothing installed; only the GUI needs GTK3.
+        run_in() { # image, command that installs GTK3 for the GUI check
+          echo "::group::$1"
+          docker run --rm -v "$out:/out:ro" "$1" sh -c "
+            /out/ProxyBridge --help | grep -q -- '--profile' && echo 'CLI starts with nothing installed' &&
+            missing=\$(ldd /out/ProxyBridge /out/libproxybridge.so 2>&1 | grep 'not found' || true) &&
+            if [ -n \"\$missing\" ]; then echo \"missing: \$missing\"; exit 1; fi && echo 'CLI and library: all libraries resolve' &&
+            $2 >/dev/null 2>&1 &&
+            missing=\$(LD_LIBRARY_PATH=/out ldd /out/ProxyBridgeGUI 2>&1 | grep 'not found' || true) &&
+            if [ -n \"\$missing\" ]; then echo \"missing: \$missing\"; exit 1; fi && echo 'GUI: all libraries resolve with GTK3'"
+          echo "::endgroup::"
+        }
+        run_in ubuntu:22.04 "apt-get update && apt-get install -y libgtk-3-0"
+        run_in debian:12 "apt-get update && apt-get install -y libgtk-3-0"
+        run_in fedora:40 "dnf install -y gtk3"
+      shell: bash
+
+    - name: Verify the build left the source tree clean
+      run: |
+        # build.sh compiles in a temp directory: no untracked or ignored file may appear outside Linux/output/
+        status="$(git status --porcelain --ignored)"
+        dirty="$(grep -E '^(\?\?|!!)' <<<"$status" | grep -v 'Linux/output' || true)"
+        if [ -n "$dirty" ]; then
+          echo "✗ build left files outside Linux/output:"
+          echo "$dirty"
+          exit 1
+        fi
+        echo "✓ source tree clean (only Linux/output/ was written)"
+      shell: bash
+
+    - name: End-to-end tests with the real kernel datapath (best effort)
+      # Needs root, cgroup v2 and a BTF kernel. GitHub-hosted runners usually have them, but this is not guaranteed,
+      # so a failure here is reported without failing the build.
+      continue-on-error: true
+      timeout-minutes: 15
+      run: |
+        sudo apt-get install -y dnsutils libgtk-3-bin >/dev/null
+        uname -r
+        ls /sys/kernel/btf/vmlinux && mount | grep -q "type cgroup2" || { echo "kernel lacks BTF or cgroup2: skipping"; exit 0; }
+        fail=0
+        for t in e2e e2e_rules e2e_domains e2e_security e2e_profile e2e_parity e2e_cli e2e_faults e2e_udp e2e_rules_diff e2e_logging e2e_exempt e2e_lifecycle api_live e2e_daemon e2e_service; do
+          echo "::group::$t"
+          sudo env PB_DIR="$PWD/Linux/output" BPFTOOL="$BPFTOOL" bash "Linux/tests/$t.sh" || fail=1
+          echo "::endgroup::"
+        done
+        echo "::group::e2e_checker"
+        env PB_DIR="$PWD/Linux/output" bash Linux/tests/e2e_checker.sh || fail=1
+        echo "::endgroup::"
+        for t in gui_headless gui_ui gui_service; do
+          echo "::group::$t"
+          if command -v broadwayd > /dev/null; then
+            if [ "$t" = gui_headless ]; then sudo env BPFTOOL="$BPFTOOL" bash Linux/tests/gui_headless.sh "$PWD/Linux/output/ProxyBridgeGUI" "$PWD/Linux/output" || fail=1
+            elif [ "$t" = gui_service ]; then sudo env BPFTOOL="$BPFTOOL" bash Linux/tests/gui_service.sh "$PWD/Linux/output" || fail=1
+            else sudo env BPFTOOL="$BPFTOOL" bash Linux/tests/gui_ui.sh "$PWD/Linux/output" || fail=1; fi
+          else echo "broadwayd not available: skipped"; fi
+          echo "::endgroup::"
+        done
+        exit $fail
+      shell: bash
+
+    - name: Coverage report
+      # Measures the whole suite; reported, never gating the build.
+      continue-on-error: true
+      timeout-minutes: 40
+      run: |
+        sudo env BPFTOOL="$BPFTOOL" COV_DIR="$RUNNER_TEMP/pb-coverage" bash Linux/tests/coverage.sh
       shell: bash
 
     - name: Upload artifacts

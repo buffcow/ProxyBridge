@@ -2,9 +2,9 @@ name: Build Windows
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ master, dev ]
   pull_request:
-    branches: [ main, dev ]
+    branches: [ master, dev ]
   workflow_dispatch:
 
 permissions:
@@ -66,11 +66,77 @@ jobs:
         }
       shell: pwsh
 
+    # Tests build from the real sources and never load the WinDivert driver or touch the network, so they run on
+    # a hosted runner. They run before the build so a failing change is reported first. See Windows\tests\.
+    - name: Run tests (engine, profiles, parsers, service, proxy protocols, CLI, static checks)
+      run: |
+        cd Windows
+        .\tests\run_tests.ps1 -SkipUi
+      shell: pwsh
+
+    # The GUI tests create real windows (the Proxy Rules window and the main window) and need a desktop session;
+    # they are a separate step so a runner without one is easy to tell apart from a real failure.
+    - name: Run GUI tests (Proxy Rules window, main window, dialogs)
+      run: |
+        cd Windows
+        .\tests\run_tests.ps1 -Only test_rules_ui,test_main_ui,test_dialogs_ui
+      shell: pwsh
+
+    - name: Upload test output on failure
+      if: failure()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ProxyBridge-Test-Output-${{ github.sha }}
+        path: Windows/tests/out/*.txt
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Build project
       run: |
         cd Windows
         .\compile.ps1 -NoSign
       shell: pwsh
+
+    # The unit tests above use made-up data. This step runs the REAL engine and WinDivert driver (through the CLI) with a
+    # real SOCKS5 proxy (Nexus Proxy), a small real HTTP proxy and real requests to real servers, and checks that traffic
+    # goes where the rules say. It loads a kernel driver, so it only runs here on the disposable runner (the script
+    # refuses to run elsewhere). Best effort for now: it depends on the internet and on the hosted runner allowing the
+    # driver, so a failure is reported without failing the build. See Windows\tests\e2e\run_e2e.ps1.
+    - name: Real-traffic end-to-end tests (best effort)
+      continue-on-error: true
+      timeout-minutes: 25
+      run: |
+        cd Windows
+        .\tests\e2e\run_e2e.ps1 -PbDir .\output
+      shell: pwsh
+
+    # The same idea for the parts around the engine: it runs the real installer, the ProxyBridge Service, the app's own
+    # client code (Live Connections, pause, logging switches, rule changes, permissions), the real app and the real
+    # uninstaller. It installs ProxyBridge on the runner, so it runs after the step above. Best effort, same reasons.
+    # See Windows\tests\e2e\run_e2e_service.ps1.
+    - name: Real-traffic end-to-end tests, installer and service (best effort)
+      continue-on-error: true
+      timeout-minutes: 25
+      run: |
+        cd Windows
+        .\tests\e2e\run_e2e_service.ps1 -PbDir .\output
+      shell: pwsh
+
+    - name: Upload end-to-end logs
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ProxyBridge-E2E-Logs-${{ github.sha }}
+        path: |
+          Windows/tests/e2e/out/*.log
+          Windows/tests/e2e/out/*.err
+          Windows/tests/e2e/out/*.out
+          Windows/tests/e2e/out/*.pbprofile
+          Windows/tests/e2e/out_service/*.log
+          Windows/tests/e2e/out_service/*.err
+          Windows/tests/e2e/out_service/*.out
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: Upload artifacts
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

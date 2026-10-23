@@ -18,12 +18,15 @@
 #include <tlhelp32.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#define COBJMACROS
+#include <shobjidl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "res/resource.h"
 #include "api/pb_api.h"
+#include "api/pb_ipc.h"
 #include "profile/profile.h"
 #include "loc/loc.h"
 
@@ -32,6 +35,8 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 
@@ -108,6 +113,13 @@ static LogStore g_connStore, g_actStore;
 #define TIMER_LOG 1                // batched log-flush timer
 static int g_idleTicks = 0;        // consecutive idle flushes (for working-set trim)
 static HFONT     g_hMono, g_hUi;
+
+// Text scale. g_dpi is the system DPI (the app is system-DPI aware, so nothing is scaled for
+// us); g_zoom is the user's extra text-size percentage (Settings > Text Size, Ctrl+wheel,
+// Ctrl +/-/0). Fonts and the main-window layout metrics go through Sc() so the UI stays
+// readable on high-DPI screens and can be enlarged on any screen.
+static int g_dpi = 96, g_zoom = 100;
+static int Sc(int px) { return MulDiv(px, g_dpi * g_zoom, 96 * 100); }
 static HINSTANCE g_hInst;
 static NOTIFYICONDATAW g_tray;
 static BOOL      g_trayAdded = FALSE;
@@ -117,8 +129,10 @@ static BOOL      g_started = FALSE;
 
 static PBProfile g_profile;
 static wchar_t   g_activeProfile[PB_NAME_MAX] = L"Default";
-static BOOL      g_localhost = FALSE, g_trafficLog = TRUE, g_closeToTray = TRUE;
+static BOOL      g_trafficLog = TRUE, g_closeToTray = TRUE;
+static BOOL      g_proxyEnabled = TRUE;   // main switch; not saved: ProxyBridge always starts enabled
 static BOOL      g_startup = FALSE;   // "Run at Startup" (schtasks logon task)
+static BOOL      g_logEvery = FALSE;   // log every new connection (no de-duplication); saved per profile
 static BOOL      g_autoClear = TRUE;  // auto-clear logs past a line threshold to save memory
 #define AUTO_CLEAR_LINES 500
 static PBFilter  g_flt[PB_MAX_FILTER];  // connection-log filter snapshot (read by native cb)
@@ -131,7 +145,11 @@ static HMENU     g_switchMenu = NULL;   // the Profile > Switch submenu (rebuilt
 
 // small helpers
 static void W2Ux(const wchar_t* w, char* out, int cch)
-{ WideCharToMultiByte(CP_UTF8, 0, w ? w : L"", -1, out, cch, NULL, NULL); }
+{
+    if (cch <= 0) return;
+    out[0] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, w ? w : L"", -1, out, cch, NULL, NULL)) out[0] = 0;   // too small: empty, never unterminated
+}
 
 static wchar_t* U2Wdup(const char* s)
 {
@@ -148,6 +166,7 @@ static const wchar_t* ProtoName(int i)  { return i == 1 ? L"UDP" : i == 2 ? L"BO
 
 // log panel + connection filters (split out)
 #include "ui/logview.h"
+#include "ui/flows.h"
 
 // forward decls
 static void SaveActive(void);
@@ -160,6 +179,7 @@ static void RebuildProfileMenu(HWND hwnd);
 static void UpdateTitle(void);
 static void SyncMenuChecks(HWND hwnd);
 static void BuildMainMenu(HWND hwnd);
+static void ApplyZoom(HWND hwnd);
 static void RelocalizeUI(HWND hwnd);
 static UINT32 EngineAddRule(PBRule* r);
 static void EngineEditRule(PBRule* r);
@@ -230,8 +250,26 @@ static void ApplyConfigs(void)
         char h[256], u[256], p[256];
         W2Ux(c->host, h, sizeof(h)); W2Ux(c->user, u, sizeof(u)); W2Ux(c->pass, p, sizeof(p));
         c->nativeId = g_api.AddProxyConfig((PBProxyType)type, h, (unsigned short)_wtoi(c->port), u, p, c->sendDomain ? TRUE : FALSE);
-        if (c->storedId == 0) c->storedId = c->nativeId;
+        if (c->storedId == 0) c->storedId = PB_AllocConfigId(&g_profile);
     }
+}
+
+// The UTF-8 strings of one rule, in a single heap block (worst case 3 bytes per UTF-16 unit, so nothing is
+// ever cut). The GUI keeps IPs and domain names in one list; the engine takes them as two.
+typedef struct { char proc[PB_APPS_MAX * 3 + 4]; char ports[128 * 3 + 4]; char ips[PB_HOSTS_MAX * 3 + 4]; char doms[PB_HOSTS_MAX * 3 + 4]; } EngineStr;
+
+static EngineStr* EngineStrings(const PBRule* r)
+{
+    EngineStr* s = (EngineStr*)malloc(sizeof(*s));
+    size_t n = wcslen(r->hosts) + 2;
+    wchar_t* wi = (wchar_t*)malloc(n * sizeof(wchar_t));
+    wchar_t* wd = (wchar_t*)malloc(n * sizeof(wchar_t));
+    if (!s || !wi || !wd) { free(s); free(wi); free(wd); return NULL; }
+    PB_HostsSplit(r->hosts, wi, n, wd, n);
+    W2Ux(r->proc, s->proc, sizeof(s->proc)); W2Ux(r->ports, s->ports, sizeof(s->ports));
+    W2Ux(wi, s->ips, sizeof(s->ips)); W2Ux(wd, s->doms, sizeof(s->doms));
+    free(wi); free(wd);
+    return s;
 }
 
 static void ApplyRules(void)
@@ -239,38 +277,38 @@ static void ApplyRules(void)
     for (int i = 0; i < g_profile.ruleCount; i++)
     {
         PBRule* r = &g_profile.rule[i];
-        char proc[2048], hosts[512], ports[256], domains[512];
-        W2Ux(r->proc, proc, sizeof(proc)); W2Ux(r->hosts, hosts, sizeof(hosts));
-        W2Ux(r->ports, ports, sizeof(ports)); W2Ux(r->domains, domains, sizeof(domains));
-        r->nativeId = g_api.AddRule(proc, hosts, ports, domains,
+        EngineStr* s = EngineStrings(r);
+        if (!s) continue;
+        r->nativeId = g_api.AddRule(s->proc, s->ips, s->ports, s->doms,
                                     (PBRuleProtocol)ProtoIdx(r->proto), (PBRuleAction)ActionIdx(r->action),
-                                    ResolveNativeCfg(r->cfgStoredId));
+                                    ResolveNativeCfg(r->cfgStoredId), r->localhost != 0);
         if (r->nativeId && !r->enabled) g_api.DisableRule(r->nativeId);
+        free(s);
     }
 }
 
 // Add one rule to the engine, returning its (stable) native id. Enable state applied too.
 static UINT32 EngineAddRule(PBRule* r)
 {
-    char proc[2048], hosts[512], ports[256], domains[512];
-    W2Ux(r->proc, proc, sizeof(proc)); W2Ux(r->hosts, hosts, sizeof(hosts));
-    W2Ux(r->ports, ports, sizeof(ports)); W2Ux(r->domains, domains, sizeof(domains));
-    UINT32 id = g_api.AddRule(proc, hosts, ports, domains,
+    EngineStr* s = EngineStrings(r);
+    if (!s) return 0;
+    UINT32 id = g_api.AddRule(s->proc, s->ips, s->ports, s->doms,
                               (PBRuleProtocol)ProtoIdx(r->proto), (PBRuleAction)ActionIdx(r->action),
-                              ResolveNativeCfg(r->cfgStoredId));
+                              ResolveNativeCfg(r->cfgStoredId), r->localhost != 0);
     if (id && !r->enabled) g_api.DisableRule(id);
+    free(s);
     return id;
 }
 // Edit an existing rule in place - keeps the same native id and list position.
 static void EngineEditRule(PBRule* r)
 {
-    char proc[2048], hosts[512], ports[256], domains[512];
-    W2Ux(r->proc, proc, sizeof(proc)); W2Ux(r->hosts, hosts, sizeof(hosts));
-    W2Ux(r->ports, ports, sizeof(ports)); W2Ux(r->domains, domains, sizeof(domains));
-    g_api.EditRule(r->nativeId, proc, hosts, ports, domains,
+    EngineStr* s = EngineStrings(r);
+    if (!s) return;
+    g_api.EditRule(r->nativeId, s->proc, s->ips, s->ports, s->doms,
                    (PBRuleProtocol)ProtoIdx(r->proto), (PBRuleAction)ActionIdx(r->action),
-                   ResolveNativeCfg(r->cfgStoredId));
+                   ResolveNativeCfg(r->cfgStoredId), r->localhost != 0);
     if (r->enabled) g_api.EnableRule(r->nativeId); else g_api.DisableRule(r->nativeId);
+    free(s);
 }
 
 static void UnapplyProfile(void)
@@ -285,13 +323,14 @@ static void SwitchToProfile(const wchar_t* name)
     PB_SetActiveProfile(name);
     lstrcpynW(g_activeProfile, name, PB_NAME_MAX);
     PB_ProfileLoad(name, &g_profile);
-    g_localhost = g_profile.localhostViaProxy;
     g_trafficLog = g_profile.trafficLogging;
     g_closeToTray = g_profile.closeToTray;
     g_autoClear = g_profile.autoClearLogs;
+    g_logEvery = g_profile.logEveryConnection != 0;
+    if (g_profile.fontZoom != g_zoom) { g_zoom = g_profile.fontZoom; ApplyZoom(g_hMain); }
     ApplyFilterSnapshot();
-    g_api.SetLocalhostViaProxy(g_localhost);
     g_api.SetTrafficLoggingEnabled(g_trafficLog);
+    g_api.SetLogEveryConnection(g_logEvery);
     ApplyConfigs();
     ApplyRules();
     SyncMenuChecks(g_hMain);
@@ -301,7 +340,7 @@ static void SwitchToProfile(const wchar_t* name)
 
 static void UpdateTitle(void)
 {
-    wchar_t t[128]; _snwprintf_s(t, 128, _TRUNCATE, L"%s - %s", APP_TITLE, g_activeProfile);
+    wchar_t t[160]; _snwprintf_s(t, 160, _TRUNCATE, L"%s - %s%s", APP_TITLE, g_activeProfile, g_proxyEnabled ? L"" : T(S_TITLE_PAUSED));
     SetWindowTextW(g_hMain, t);
 }
 
@@ -326,6 +365,8 @@ static void BuildMainMenu(HWND hwnd)
     HMENU bar = CreateMenu();
 
     HMENU proxy = CreatePopupMenu();
+    AppendMenuW(proxy, MF_STRING, IDM_PROXY_ENABLE,   T(S_M_ENABLE));       // main on/off switch
+    AppendMenuW(proxy, MF_SEPARATOR, 0, NULL);
     AppendMenuW(proxy, MF_STRING, IDM_PROXY_SETTINGS, T(S_M_PROXY_SETTINGS));
     AppendMenuW(proxy, MF_STRING, IDM_PROXY_RULES,    T(S_M_PROXY_RULES));
     AppendMenuW(proxy, MF_STRING, IDM_LOG_FILTERS,    T(S_M_LOGFILTERS));
@@ -344,11 +385,15 @@ static void BuildMainMenu(HWND hwnd)
     AppendTopMenu(bar, profile, T(S_M_PROFILE));
 
     HMENU settings = CreatePopupMenu();
-    AppendMenuW(settings, MF_STRING, IDM_SET_LOCALHOST,   T(S_M_LOCALHOST));
     AppendMenuW(settings, MF_STRING, IDM_SET_TRAFFICLOG,  T(S_M_TRAFFIC));
     AppendMenuW(settings, MF_STRING, IDM_SET_CLOSETOTRAY, T(S_M_TRAY));
     AppendMenuW(settings, MF_STRING, IDM_SET_STARTUP,     T(S_M_STARTUP));
     AppendMenuW(settings, MF_STRING, IDM_SET_AUTOCLEAR,   T(S_M_AUTOCLEAR));
+    AppendMenuW(settings, MF_STRING, IDM_SET_LOGALL,      T(S_M_LOGALL));
+    AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(settings, MF_STRING, IDM_ZOOM_IN,    T(S_M_ZOOM_IN));
+    AppendMenuW(settings, MF_STRING, IDM_ZOOM_OUT,   T(S_M_ZOOM_OUT));
+    AppendMenuW(settings, MF_STRING, IDM_ZOOM_RESET, T(S_M_ZOOM_RESET));
     AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
     HMENU lang = CreatePopupMenu();
     AppendMenuW(lang, MF_STRING, IDM_LANG_EN, T(S_M_LANG_EN));
@@ -391,6 +436,9 @@ static void RelocalizeUI(HWND hwnd)
     TCITEMW ti; ti.mask = TCIF_TEXT;
     ti.pszText = (LPWSTR)T(S_TAB_CONN); TabCtrl_SetItem(g_hTab, 0, &ti);
     ti.pszText = (LPWSTR)T(S_TAB_ACT);  TabCtrl_SetItem(g_hTab, 1, &ti);
+    ti.pszText = (LPWSTR)T(S_TAB_FLOWS); TabCtrl_SetItem(g_hTab, 2, &ti);
+    FlowsSetColumns();
+    SetWindowTextW(g_hFlowsClear, T(S_FL_CLEAR));
     // The tab strip, the Clear buttons and the search cue banners all carry localized
     // text too - refresh them here so a language switch updates them without a restart.
     SetWindowTextW(g_hConnClear, T(S_BTN_CLEARLOGS));
@@ -420,16 +468,98 @@ static void TrayAdd(HWND hwnd)
     // broadcast re-adds the icon once the taskbar actually appears
     g_trayAdded = Shell_NotifyIconW(NIM_ADD, &g_tray);
 }
+static void TrayUpdateTip(void)
+{
+    if (!g_trayAdded) return;
+    _snwprintf_s(g_tray.szTip, ARRAYSIZE(g_tray.szTip), _TRUNCATE, L"%s%s", APP_TITLE, g_proxyEnabled ? L"" : T(S_TITLE_PAUSED));
+    g_tray.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+    g_tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+}
 static void TrayRemove(void) { if (g_trayAdded) { Shell_NotifyIconW(NIM_DELETE, &g_tray); g_trayAdded = FALSE; } }
 static void ShowMainWindow(HWND hwnd) { ShowWindow(hwnd, SW_SHOW); ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+
+// Creates the three main-window fonts at the current DPI * zoom. Existing handles are left
+// alone so the caller can swap them onto the controls first and delete the old ones after.
+static void MakeFonts(void)
+{
+    g_hUi   = CreateFontW(-Sc(16), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_hMono = CreateFontW(-Sc(16), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+                          FIXED_PITCH | FF_MODERN, L"Consolas");
+    g_hIcon = CreateFontW(-Sc(18), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe MDL2 Assets");
+}
+
+static void LayoutMain(HWND hwnd);
+static void DrawMenuBar2(HWND hwnd);
+static void SaveActive(void);
+
+// Applies g_zoom: new fonts onto every control, relayout, then free the old fonts.
+static void ApplyZoom(HWND hwnd)
+{
+    HFONT oUi = g_hUi, oMono = g_hMono, oIcon = g_hIcon;
+    MakeFonts();
+    SendMessageW(g_hTab,        WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hConnLog,    WM_SETFONT, (WPARAM)g_hMono, TRUE);
+    SendMessageW(g_hActLog,     WM_SETFONT, (WPARAM)g_hMono, TRUE);
+    SendMessageW(g_hFlows,      WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hFlowsClear, WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hConnSearch, WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hActSearch,  WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hConnClear,  WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    SendMessageW(g_hActClear,   WM_SETFONT, (WPARAM)g_hUi,   TRUE);
+    if (oUi)   DeleteObject(oUi);
+    if (oMono) DeleteObject(oMono);
+    if (oIcon) DeleteObject(oIcon);
+    LayoutMain(hwnd);
+    InvalidateRect(hwnd, NULL, TRUE);
+    RedrawWindow(hwnd, NULL, NULL, RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    DrawMenuBar2(hwnd);
+}
+
+// pct: absolute percentage, clamped to 60..300.
+static void SetZoom(HWND hwnd, int pct)
+{
+    if (pct < 60) pct = 60;
+    if (pct > 300) pct = 300;
+    if (pct == g_zoom) return;
+    g_zoom = pct;
+    g_profile.fontZoom = pct;
+    ApplyZoom(hwnd);
+    SaveActive();
+}
+
+// Ctrl + mouse wheel / Ctrl + '+' '-' '0' on the log boxes and search fields.
+static LRESULT CALLBACK ZoomSubclass(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref)
+{
+    (void)id;
+    HWND main = (HWND)ref;
+    if (m == WM_MOUSEWHEEL && (GET_KEYSTATE_WPARAM(w) & MK_CONTROL))
+    {
+        int d = GET_WHEEL_DELTA_WPARAM(w);
+        if (d != 0) SetZoom(main, g_zoom + (d > 0 ? 10 : -10));
+        return 0;
+    }
+    if (m == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000))
+    {
+        if (w == VK_ADD || w == VK_OEM_PLUS)       { SetZoom(main, g_zoom + 10); return 0; }
+        if (w == VK_SUBTRACT || w == VK_OEM_MINUS) { SetZoom(main, g_zoom - 10); return 0; }
+        if (w == L'0' || w == VK_NUMPAD0)          { SetZoom(main, 100);         return 0; }
+    }
+    return DefSubclassProc(h, m, w, l);
+}
 
 static void LayoutMain(HWND hwnd)
 {
     RECT rc; GetClientRect(hwnd, &rc);
-    int tabTop = 6, tabH = 32;               // small gap below the menu bar
+    int tabTop = Sc(6), tabH = Sc(32);       // small gap below the menu bar
     MoveWindow(g_hTab, 0, tabTop, rc.right, tabH, TRUE);
-    int top = tabTop + tabH + 6;
-    int barH = 30, clearW = 130, gap = 6;
+    int top = tabTop + tabH + Sc(6);
+    int barH = Sc(30), clearW = Sc(130), gap = Sc(6);
     int searchW = rc.right - 4 - clearW - gap - 4;
     int logTop = top + barH + 4;
     int logH = rc.bottom - logTop - 4; if (logH < 0) logH = 0;
@@ -440,22 +570,28 @@ static void LayoutMain(HWND hwnd)
     MoveWindow(g_hActClear,   4 + searchW + gap, top - 1, clearW, barH - 2, TRUE);
     MoveWindow(g_hConnLog, 2, logTop, rc.right - 4, logH, TRUE);
     MoveWindow(g_hActLog,  2, logTop, rc.right - 4, logH, TRUE);
+    MoveWindow(g_hFlowsClear, 4, top - 1, clearW, barH - 2, TRUE);
+    MoveWindow(g_hFlows, 2, logTop, rc.right - 4, logH, TRUE);
 }
 static void SelectTab(int idx)
 {
     int c = (idx == 0) ? SW_SHOW : SW_HIDE;
     int a = (idx == 1) ? SW_SHOW : SW_HIDE;
+    int f = (idx == 2) ? SW_SHOW : SW_HIDE;
+    ShowWindow(g_hFlows, f); ShowWindow(g_hFlowsClear, f);
+    FlowsActivate(g_hMain, idx == 2);
     ShowWindow(g_hConnLog, c); ShowWindow(g_hConnSearch, c); ShowWindow(g_hConnClear, c);
     ShowWindow(g_hActLog,  a); ShowWindow(g_hActSearch,  a); ShowWindow(g_hActClear,  a);
 }
 static void SyncMenuChecks(HWND hwnd)
 {
     HMENU m = GetMenu(hwnd);
-    CheckMenuItem(m, IDM_SET_LOCALHOST,   MF_BYCOMMAND | (g_localhost  ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, IDM_PROXY_ENABLE,    MF_BYCOMMAND | (g_proxyEnabled ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(m, IDM_SET_TRAFFICLOG,  MF_BYCOMMAND | (g_trafficLog ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(m, IDM_SET_CLOSETOTRAY, MF_BYCOMMAND | (g_closeToTray? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(m, IDM_SET_STARTUP,     MF_BYCOMMAND | (g_startup    ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(m, IDM_SET_AUTOCLEAR,   MF_BYCOMMAND | (g_autoClear  ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(m, IDM_SET_LOGALL,      MF_BYCOMMAND | (g_logEvery   ? MF_CHECKED : MF_UNCHECKED));
     int zh = (_wcsicmp(g_profile.language, L"zh") == 0);
     CheckMenuItem(m, IDM_LANG_EN, MF_BYCOMMAND | (zh ? MF_UNCHECKED : MF_CHECKED));
     CheckMenuItem(m, IDM_LANG_ZH, MF_BYCOMMAND | (zh ? MF_CHECKED : MF_UNCHECKED));
@@ -543,12 +679,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
         ChangeWindowMessageFilterEx(hwnd, g_wmTaskbarCreated, MSGFLT_ALLOW, NULL);
-        g_hUi   = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        g_hMono = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                              FIXED_PITCH | FF_MODERN, L"Consolas");
+        MakeFonts();
         g_hTab = CreateWindowExW(0, WC_TABCONTROLW, NULL,
                                  WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_OWNERDRAWFIXED,
                                  0, 0, 0, 0, hwnd, NULL, g_hInst, NULL);
@@ -556,6 +687,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         TCITEMW ti; ti.mask = TCIF_TEXT;
         ti.pszText = (LPWSTR)T(S_TAB_CONN); TabCtrl_InsertItem(g_hTab, 0, &ti);
         ti.pszText = (LPWSTR)T(S_TAB_ACT);  TabCtrl_InsertItem(g_hTab, 1, &ti);
+        ti.pszText = (LPWSTR)T(S_TAB_FLOWS); TabCtrl_InsertItem(g_hTab, 2, &ti);
+        FlowsCreate(hwnd);
+        SendMessageW(g_hFlows, WM_SETFONT, (WPARAM)g_hUi, TRUE);
+    SendMessageW(g_hFlowsClear, WM_SETFONT, (WPARAM)g_hUi, TRUE);
 
         DWORD es = WS_CHILD | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER;
         g_hConnLog = CreateWindowExW(0, L"EDIT", NULL, es | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, g_hInst, NULL);
@@ -577,6 +712,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageW(g_hActClear,   WM_SETFONT, (WPARAM)g_hUi, TRUE);
         SendMessageW(g_hConnSearch, EM_SETCUEBANNER, TRUE, (LPARAM)T(S_SEARCH_CUE));
         SendMessageW(g_hActSearch,  EM_SETCUEBANNER, TRUE, (LPARAM)T(S_SEARCH_CUE));
+        SetWindowSubclass(g_hConnLog,    ZoomSubclass, 1, (DWORD_PTR)hwnd);
+        SetWindowSubclass(g_hActLog,     ZoomSubclass, 1, (DWORD_PTR)hwnd);
+        SetWindowSubclass(g_hConnSearch, ZoomSubclass, 1, (DWORD_PTR)hwnd);
+        SetWindowSubclass(g_hActSearch,  ZoomSubclass, 1, (DWORD_PTR)hwnd);
         LogStoreInit(&g_connStore, g_hConnLog);
         LogStoreInit(&g_actStore,  g_hActLog);
         SetTimer(hwnd, TIMER_LOG, 200, NULL);   // batch log updates ~5x/sec
@@ -584,9 +723,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // Menu-bar quick-access icons are drawn on the (non-client) menu bar in WM_NCPAINT;
         // this is their glyph font. The menu-bar font is used to owner-draw the top-level
         // items so the menu row can be a bit taller.
-        g_hIcon = CreateFontW(-18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe MDL2 Assets");
         NONCLIENTMETRICSW ncm; ncm.cbSize = sizeof(ncm);
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
             g_hMenuFont = CreateFontIndirectW(&ncm.lfMenuFont);
@@ -603,6 +739,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_SIZE:  LayoutMain(hwnd); DrawMenuBar2(hwnd); return 0;
+    case WM_MOUSEWHEEL:
+        if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)
+        {
+            int d = GET_WHEEL_DELTA_WPARAM(wp);
+            if (d != 0) SetZoom(hwnd, g_zoom + (d > 0 ? 10 : -10));
+            return 0;
+        }
+        break;
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLORBTN:
@@ -730,10 +874,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_NOTIFY:
     {
         LPNMHDR nh = (LPNMHDR)lp;
+        if (nh->hwndFrom == g_hFlows) return FlowsNotify(lp);
         if (nh->hwndFrom == g_hTab && nh->code == TCN_SELCHANGE) SelectTab(TabCtrl_GetCurSel(g_hTab));
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_FLOWS) { if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) FlowsPollAsync(); return 0; }   // only while the Live Connections tab is open
         if (wp == TIMER_LOG)
         {
             int processed = LogStoreFlush(&g_connStore) + LogStoreFlush(&g_actStore);
@@ -757,6 +903,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_APP_FLOWS: FlowsOnResult((UINT32)wp); return 0;
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_LBUTTONDBLCLK) ShowMainWindow(hwnd);
         else if (LOWORD(lp) == WM_RBUTTONUP)
@@ -764,6 +911,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             POINT pt; GetCursorPos(&pt);
             HMENU pm = CreatePopupMenu();
             AppendMenuW(pm, MF_STRING, IDM_TRAY_SHOW, T(S_TRAY_SHOW));
+            AppendMenuW(pm, MF_STRING | (g_proxyEnabled ? MF_CHECKED : MF_UNCHECKED), IDM_PROXY_ENABLE, T(S_M_ENABLE));
             AppendMenuW(pm, MF_SEPARATOR, 0, NULL);
             AppendMenuW(pm, MF_STRING, IDM_TRAY_EXIT, T(S_TRAY_EXIT));
             SetForegroundWindow(hwnd);
@@ -783,11 +931,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         switch (id)
         {
+        case IDC_FLOWS_CLEAR:    FlowsClearClosed(); return 0;
         case IDM_PROXY_SETTINGS: DialogBoxW(g_hInst, MAKEINTRESOURCEW(IDD_SERVERS), hwnd, ServersDlgProc); return 0;
         case IDM_PROXY_RULES:    DialogBoxW(g_hInst, MAKEINTRESOURCEW(IDD_RULES),   hwnd, RulesDlgProc);   return 0;
-        case IDM_SET_LOCALHOST:
-            g_localhost = !g_localhost; g_profile.localhostViaProxy = g_localhost;
-            g_api.SetLocalhostViaProxy(g_localhost); SaveActive(); SyncMenuChecks(hwnd); return 0;
+        case IDM_PROXY_ENABLE:
+            g_proxyEnabled = !g_proxyEnabled;
+            g_api.SetEnabled(g_proxyEnabled);
+            UpdateTitle(); TrayUpdateTip(); SyncMenuChecks(hwnd);
+            return 0;
         case IDM_SET_TRAFFICLOG:
             g_trafficLog = !g_trafficLog; g_profile.trafficLogging = g_trafficLog;
             g_api.SetTrafficLoggingEnabled(g_trafficLog); SaveActive(); SyncMenuChecks(hwnd); return 0;
@@ -798,9 +949,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_startup = !g_startup; StartupSet(g_startup);
             g_startup = StartupIsEnabled();   // reflect the real state
             SyncMenuChecks(hwnd); return 0;
+        case IDM_SET_LOGALL:
+            g_logEvery = !g_logEvery; g_profile.logEveryConnection = g_logEvery;
+            g_api.SetLogEveryConnection(g_logEvery); SaveActive(); SyncMenuChecks(hwnd); return 0;
         case IDM_SET_AUTOCLEAR:
             g_autoClear = !g_autoClear; g_profile.autoClearLogs = g_autoClear;
             SaveActive(); SyncMenuChecks(hwnd); return 0;
+        case IDM_ZOOM_IN:    SetZoom(hwnd, g_zoom + 10); return 0;
+        case IDM_ZOOM_OUT:   SetZoom(hwnd, g_zoom - 10); return 0;
+        case IDM_ZOOM_RESET: SetZoom(hwnd, 100);         return 0;
         case IDM_LOG_FILTERS:
             if (DialogBoxW(g_hInst, MAKEINTRESOURCEW(IDD_FILTERS), hwnd, FiltersDlgProc))
             {
@@ -875,7 +1032,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case IDM_HELP_DOCS:
-            ShellExecuteW(hwnd, L"open", L"https://interceptsuite.com/docs/proxybridge/", NULL, NULL, SW_SHOWNORMAL);
+            ShellExecuteW(hwnd, L"open", L"https://proxybridge.interceptsuite.com/docs/", NULL, NULL, SW_SHOWNORMAL);
             return 0;
         case IDM_HELP_UPDATE:
             UpdStartCheck(hwnd, TRUE);   // manual: also reports "up to date" / errors
@@ -920,6 +1077,69 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 #include "ui/dialogs.h"
 
 
+// Connects to the engine. Normal path: the ProxyBridgeSvc service (installed once by setup)
+// so this process stays unprivileged. Fallback for a portable/unzipped copy with no service:
+// load ProxyBridgeCore.dll in-process, which needs elevation - relaunch elevated once.
+static BOOL IsElevated(void)
+{
+    BOOL elevated = FALSE; HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+    {
+        TOKEN_ELEVATION te; DWORD n = 0;
+        if (GetTokenInformation(tok, TokenElevation, &te, sizeof(te), &n)) elevated = te.TokenIsElevated != 0;
+        CloseHandle(tok);
+    }
+    return elevated;
+}
+
+static BOOL ConnectEngine(void)
+{
+    int rc = PB_LoadService(&g_api);
+    if (rc == PB_IPC_OK) return TRUE;
+
+    if (rc == PB_IPC_BUSY)
+    {
+        MessageBoxW(NULL, L"Another ProxyBridge window (possibly in a different user session) is already "
+                          L"connected to the ProxyBridge service.\nClose it and try again.",
+                    APP_TITLE, MB_OK | MB_ICONWARNING);
+        return FALSE;
+    }
+    if (rc == PB_IPC_BAD_VERSION)
+    {
+        MessageBoxW(NULL, L"The installed ProxyBridge service is a different version than this program.\n"
+                          L"Re-run the ProxyBridge installer.", APP_TITLE, MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
+
+    if (rc == PB_IPC_DENIED)
+    {
+        // The service refuses this account. Offer the elevated stand-alone mode as a fallback.
+        if (MessageBoxW(NULL, L"This account is not allowed to use the ProxyBridge service.\n"
+                              L"Ask an administrator to add you to the \"ProxyBridge Users\" group, then sign out and in.\n"
+                              L"Run as administrator instead?",
+                        APP_TITLE, MB_YESNO | MB_ICONWARNING) != IDYES)
+            return FALSE;
+    }
+
+    // No service: portable mode.
+    if (!IsElevated())
+    {
+        wchar_t exe[MAX_PATH]; GetModuleFileNameW(NULL, exe, MAX_PATH);
+        SHELLEXECUTEINFOW sei; ZeroMemory(&sei, sizeof(sei));
+        sei.cbSize = sizeof(sei); sei.lpVerb = L"runas"; sei.lpFile = exe; sei.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&sei);   // on UAC cancel just exit
+        return FALSE;
+    }
+    if (!PB_LoadDirect(&g_api))
+    {
+        MessageBoxW(NULL, L"Could not load ProxyBridgeCore.dll.\n"
+                          L"Make sure it is in the same folder as this executable.",
+                    APP_TITLE, MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 // entry point
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 {
@@ -927,34 +1147,34 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
     g_hInst = hInst;
     BOOL startMinimized = (cmd && wcsstr(cmd, L"--minimized") != NULL);
 
+    {
+        HDC sdc = GetDC(NULL);
+        if (sdc) { int d = GetDeviceCaps(sdc, LOGPIXELSY); if (d >= 96) g_dpi = d; ReleaseDC(NULL, sdc); }
+    }
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);
-
-    if (!PB_Load(&g_api))
-    {
-        MessageBoxW(NULL, L"Could not load ProxyBridgeCore.dll.\n"
-                          L"Make sure it is in the same folder as this executable.",
-                    APP_TITLE, MB_OK | MB_ICONERROR);
-        return 1;
-    }
 
     // Load the active profile.
     PB_GetActiveProfile(g_activeProfile, PB_NAME_MAX);
     PB_ProfileLoad(g_activeProfile, &g_profile);
-    g_localhost   = g_profile.localhostViaProxy;
     g_trafficLog  = g_profile.trafficLogging;
     g_closeToTray = g_profile.closeToTray;
+    g_zoom        = g_profile.fontZoom;
     g_lang        = (_wcsicmp(g_profile.language, L"zh") == 0) ? 1 : 0;
 
-    // Refuse to start if another GUI or the CLI is already running - they'd both grab the
-    // WinDivert driver and the same relay ports.
+    // Refuse to start if another GUI or the CLI is already running - they'd both drive the
+    // same engine (the service accepts one client at a time) and the same relay ports.
     if (AnotherInstanceRunning())
     {
         MessageBoxW(NULL, T(S_ERR_RUNNING), APP_TITLE, MB_OK | MB_ICONWARNING);
         return 0;
     }
 
+    if (!ConnectEngine())
+        return 1;
+
     g_autoClear   = g_profile.autoClearLogs;
+    g_logEvery    = g_profile.logEveryConnection != 0;
     g_startup     = StartupIsEnabled();
     ApplyFilterSnapshot();
 
@@ -972,8 +1192,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
     wc.lpszMenuName = NULL;   // menu is built programmatically (localizable)
     if (!RegisterClassExW(&wc)) return 1;
 
+    // Default window size scales with the system DPI (1200x820 at 100%) but never exceeds the
+    // work area, so it is not a postage stamp on a 3072x1920 screen or off-screen on a small one.
+    int winW = MulDiv(1200, g_dpi, 96), winH = MulDiv(820, g_dpi, 96);
+    {
+        RECT wa;
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0))
+        {
+            int maxW = (wa.right - wa.left) * 9 / 10, maxH = (wa.bottom - wa.top) * 9 / 10;
+            if (winW > maxW) winW = maxW;
+            if (winH > maxH) winH = maxH;
+        }
+    }
     g_hMain = CreateWindowExW(0, WND_CLASS, APP_TITLE, WS_OVERLAPPEDWINDOW,
-                              CW_USEDEFAULT, CW_USEDEFAULT, 1200, 820, NULL, NULL, hInst, NULL);
+                              CW_USEDEFAULT, CW_USEDEFAULT, winW, winH, NULL, NULL, hInst, NULL);
     if (!g_hMain) return 1;
 
     // Center on the working area of the monitor the window landed on (CW_USEDEFAULT places
@@ -1000,8 +1232,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 
     // Wire callbacks + toggles, add configs (before Start so the UDP relay starts), start,
     // then add rules.
-    g_api.SetLocalhostViaProxy(g_localhost);
     g_api.SetTrafficLoggingEnabled(g_trafficLog);
+    g_api.SetLogEveryConnection(g_logEvery);
+    g_api.SetEnabled(g_proxyEnabled);
     g_api.SetLogCallback(PBLogCb);
     g_api.SetConnectionCallback(PBConnCb);
     ApplyConfigs();
