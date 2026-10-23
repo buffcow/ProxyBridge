@@ -57,6 +57,13 @@ static PbW   W;
 static void  begin(UINT32 op) { PbW_Init(&W, rq, sizeof rq); PbW_U32(&W, op); }
 static BOOL  run(UINT32* ret) { PbW resp; PbW_Init(&resp, rs, sizeof rs); BOOL ok = Dispatch(rq, W.len, &resp); if (ok && ret) { PbR r; PbR_Init(&r, rs, resp.len); *ret = PbR_U32(&r); } return ok; }
 
+static DWORD WINAPI TestWaitPipe(LPVOID arg)
+{
+    ConnJob *job = (ConnJob *)arg;
+    job->ok = WaitPipeClient(job->pipe, 5000);
+    return 0;
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -193,12 +200,31 @@ int main(void)
           g_stop = 0;
           CHECK(!WaitPipeClient(pipe, 50));
           DisconnectNamedPipe(pipe);
-          HANDLE client = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
-          CHECK(client != INVALID_HANDLE_VALUE);
-          if (client != INVALID_HANDLE_VALUE)
+          // A disconnected pipe is not listening. Re-arm ConnectNamedPipe via
+          // the production helper before the client attempts to reconnect.
+          ConnJob job = { pipe, FALSE };
+          HANDLE waiter = CreateThread(NULL, 0, TestWaitPipe, &job, 0, NULL);
+          CHECK(waiter != NULL);
+          if (waiter != NULL)
           {
-              CHECK(WaitPipeClient(pipe, 1000));
-              CloseHandle(client);
+              HANDLE client = INVALID_HANDLE_VALUE;
+              DWORD err = 0;
+              ULONGLONG deadline = GetTickCount64() + 3000;
+              do {
+                  client = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+                  if (client != INVALID_HANDLE_VALUE) break;
+                  err = GetLastError();
+                  if (err != ERROR_PIPE_BUSY && err != ERROR_PIPE_NOT_CONNECTED && err != ERROR_NO_DATA) break;
+                  Sleep(10);
+              } while (GetTickCount64() < deadline);
+              if (client == INVALID_HANDLE_VALUE) printf("  pipe reconnect failed: %lu\n", err);
+              CHECK(client != INVALID_HANDLE_VALUE);
+              CHECK(WaitForSingleObject(waiter, 7000) == WAIT_OBJECT_0);
+              // Always join before the stack-owned job goes out of scope.
+              WaitForSingleObject(waiter, INFINITE);
+              CHECK(job.ok);
+              CloseHandle(waiter);
+              if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
           }
           DisconnectNamedPipe(pipe);
           g_stop = 1;
