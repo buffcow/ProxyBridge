@@ -528,8 +528,8 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                         else
                         {
                             InterlockedDecrement(&g_handler_threads);
-                            remove_connection_mapping(client_port, FALSE, FALSE, conn_config->mapping_id);
                             closesocket(client_sock);
+                            finish_tcp_relay(client_port, FALSE, conn_config->mapping_id);
                             free(conn_config);
                         }
                     }
@@ -564,8 +564,8 @@ DWORD WINAPI local_proxy_server(LPVOID arg)
                         else
                         {
                             InterlockedDecrement(&g_handler_threads);
-                            remove_connection_mapping(client_port, FALSE, TRUE, conn_config->mapping_id);
                             closesocket(client_sock6);
+                            finish_tcp_relay(client_port, TRUE, conn_config->mapping_id);
                             free(conn_config);
                         }
                     }
@@ -774,7 +774,7 @@ static DWORD WINAPI connection_handler_impl(LPVOID arg)
 cleanup:
     if (client_sock != INVALID_SOCKET) closesocket(client_sock);
     if (socks_sock != INVALID_SOCKET) closesocket(socks_sock);
-    remove_connection_mapping(client_port, FALSE, is_ipv6, mapping_id);
+    finish_tcp_relay(client_port, is_ipv6, mapping_id);
     return 0;
 }
 
@@ -979,10 +979,10 @@ static void relay_release(RELAY_CONN *rc)
     LeaveCriticalSection(&g_relay_lock);
     closesocket(rc->s[0]);
     closesocket(rc->s[1]);
-    // The handshake thread handed ownership to the pool. Only the last IOCP
-    // direction may release its mapping, and never a newer flow on the same port.
+    // The last IOCP direction starts a close grace period. The kernel can still
+    // send queued segments after closesocket returns, and those need the mapping.
     if (rc->meta.mapping_id != 0)
-        remove_connection_mapping(rc->meta.client_port, FALSE, rc->meta.v6, rc->meta.mapping_id);
+        finish_tcp_relay(rc->meta.client_port, rc->meta.v6, rc->meta.mapping_id);
     relay_buf_put(rc->dir[0].buf);
     relay_buf_put(rc->dir[1].buf);
     free(rc);

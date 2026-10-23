@@ -74,13 +74,14 @@ typedef struct PROCESS_RULE {
 #define SOCKS5_ATYP_DOMAIN 0x03  // send hostname to proxy rfc 1928
 #define SOCKS5_AUTH_NONE   0x00
 
-// Connection setup and lifecycle bounds. Active TCP relays own their mapping until the
-// relay worker or IOCP cleanup finishes; only pending TCP mappings and idle UDP mappings are
-// eligible for background cleanup.
+// Active relays retain their mapping. After socket close, keep it for late data,
+// FIN/ACK and retransmissions; a fresh SYN replaces it immediately with a new generation.
 #define UDP_MAPPING_IDLE_TIMEOUT_MS 120000
 #define TCP_PENDING_MAPPING_TIMEOUT_MS 30000
-#define TCP_PROXY_CONNECT_TIMEOUT_MS 5000
-#define PROXY_HANDSHAKE_TIMEOUT_MS 5000
+#define TCP_CLOSING_MAPPING_TIMEOUT_MS 120000
+#define TCP_PROXY_CONNECT_TIMEOUT_MS 30000
+#define PROXY_HANDSHAKE_TIMEOUT_MS 30000
+#define TCP_HANDLER_STOP_TIMEOUT_MS (2 * TCP_PROXY_CONNECT_TIMEOUT_MS + PROXY_HANDSHAKE_TIMEOUT_MS + 5000)
 #define PROXY_DNS_CACHE_TTL_MS 300000
 #define SLOW_PACKET_DECISION_MS 50
 #define SLOW_RELAY_SETUP_MS 250
@@ -118,6 +119,7 @@ typedef struct CONNECTION_INFO {
     BOOL   is_ipv6;
     UINT32 mapping_id;          // distinguishes recycled source-port generations
     volatile LONG relay_active; // live TCP relays own their mapping until handler cleanup
+    ULONGLONG relay_closed_at;  // nonzero: fixed grace period, not extended by late packets
     UINT8  src_ip6[16];        // raw IPv6 src (only valid when is_ipv6)
     UINT8  orig_dest_ip6[16];  // raw IPv6 dest (only valid when is_ipv6)
     struct CONNECTION_INFO *next;      // chain in the forward table (keyed by src_port)
@@ -394,9 +396,9 @@ void udp_direct_reset(void);
 
 // TCP close handling. A FIN must NOT delete the entry on the spot: a client that sends and closes
 // at once can have its FIN seen before the relay has accept()ed - the relay's lookup then fails
-// and the connection (and its data) is silently dropped. The entry is kept until both sides have
-// sent their FIN (bit 1 = app, bit 2 = relay). An active relay owns its mapping until
-// its worker/pool cleanup; a reset still removes it immediately.
+// and the connection (and its data) is silently dropped. Record both FINs (bit 1 = app,
+// bit 2 = relay) without deleting: their ACKs/retransmissions still need translation.
+// Worker/pool cleanup starts a bounded grace period; a reset may remove it immediately.
 void connection_fin(UINT16 src_port, BOOL is_ipv6, UINT8 bit);
 
 BOOL is_connection_tracked(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
@@ -411,6 +413,7 @@ BOOL get_connection_full_v6_x(UINT16 src_port, BOOL is_udp, UINT8 dest_ip6[16], 
 UINT32 udp_flows_snapshot(PB_FLOW *out, UINT32 max);
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp);
 BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id);
+BOOL finish_tcp_relay(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id);
 void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
 // A nonzero id removes only that generation; zero is reserved for packet-side teardown.
 BOOL remove_connection_mapping(UINT16 src_port, BOOL is_udp, BOOL is_ipv6, UINT32 mapping_id);

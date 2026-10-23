@@ -128,11 +128,15 @@ int main(void)
     CHECK(wait_flows(0, 0, 0));
     for (int i = 0; i < 300 && g_active_relays > 0; i++) Sleep(10);
     CHECK(g_active_relays == 0);                                                            /* nothing leaked */
-    CHECK(!is_connection_tracked(m2.client_port, FALSE, TRUE));
-    CHECK(!port_is_decided(m2.client_port, TRUE));
+    CHECK(is_connection_tracked(m2.client_port, FALSE, TRUE)); /* IOCP ended, TCP may still have queued packets */
+    CHECK(!mark_tcp_relay_active(m2.client_port, TRUE, m2.mapping_id)); /* now closing */
+    connection_fin(m2.client_port, TRUE, 1); connection_fin(m2.client_port, TRUE, 2);
+    CHECK(get_tcp_connection_config(m2.client_port, TRUE, &tracked) && tracked.mapping_id == m2.mapping_id);
+    CHECK(port_is_decided(m2.client_port, TRUE));
     CHECK(get_tcp_connection_config(m.client_port, FALSE, &tracked) && tracked.mapping_id == replacement.mapping_id);
     CHECK(port_is_decided(m.client_port, FALSE));
     remove_connection(m.client_port, FALSE, FALSE);
+    remove_connection(m2.client_port, FALSE, TRUE);
     closesocket(px2);
 
     relay_pool_stop();

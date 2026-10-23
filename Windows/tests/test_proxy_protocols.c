@@ -13,6 +13,7 @@ typedef struct {
     int  close_at;             /* 1 = close after the greeting, 2 = after auth, 3 = after the request without a reply */
     BOOL http;
     int split_at; DWORD split_delay; /* split an HTTP response across separate writes */
+    DWORD reply_delay;          /* local SOCKS5 proxy waiting for a slow remote target */
     /* captured */
     BYTE greeting[16]; int greeting_len;
     char user[300], pass[300];
@@ -74,6 +75,7 @@ static DWORD WINAPI server_thread(LPVOID p)
     if (b[3] == 3) { if (!rx(c, b + 4, 1)) { closesocket(c); return 0; } rest = b[4] + 2; if (!rx(c, b + 5, rest)) { closesocket(c); return 0; } sc->req_len = 5 + rest; }
     else           { if (rest && !rx(c, b + 4, rest)) { closesocket(c); return 0; } sc->req_len = 4 + rest; }
     memcpy(sc->req, b, sc->req_len);
+    if (sc->reply_delay) Sleep(sc->reply_delay);
     if (sc->close_at != 3 && sc->reply_len) send(c, (char*)sc->reply, sc->reply_len, 0);
     Sleep(20);                                   /* let the client read the reply before the FIN */
     closesocket(c); return 0;
@@ -120,6 +122,9 @@ int main(void)
     CHECK(s5_v4(&sc, &none) == 0);
     CHECK(sc.greeting_len == 3 && sc.greeting[0] == 5 && sc.greeting[1] == 1 && sc.greeting[2] == 0);        /* offers "no auth" only */
     CHECK(sc.req_len == 10 && !memcmp(sc.req, "\x05\x01\x00\x01\x01\x02\x03\x04\x01\xBB", 10));                  /* CONNECT 1.2.3.4:443 */
+    /* A local proxy can take more than five seconds to connect to the remote destination. */
+    memset(&sc, 0, sizeof sc); sc.reply_delay = 6000; set_reply(&sc, OKREPLY, 10);
+    CHECK(s5_v4(&sc, &none) == 0);
 
     /* ---- username/password (RFC 1929) ---- */
     memset(&sc, 0, sizeof sc); sc.method = 2; set_reply(&sc, OKREPLY, 10);
@@ -206,7 +211,7 @@ int main(void)
         UINT8 a6[16]; inet_pton(AF_INET6, "2001:db8::7", a6);
         Srv sv; memset(&sc, 0, sizeof sc); sc.http = TRUE;
         set_text(&sc, "HTTP/1.1 200 OK\r\nX-Test: split\r\n\r\nSSH-2.0-test\r\n");
-        sc.split_at = 18; sc.split_delay = 50;
+        sc.split_at = 18; sc.split_delay = v6 ? 50 : 6000; /* slow CONNECT response must also succeed */
         SOCKET c = start(&sv, &sc);
         int r = v6 ? http_connect_v6(c, a6, 443, &none) : http_connect(c, ip4("1.2.3.4"), 443, &none);
         CHECK(r == 0);

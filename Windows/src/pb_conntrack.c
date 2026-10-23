@@ -66,6 +66,7 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
             existing->fin_flags = 0;
             existing->mapping_id = next_mapping_id_locked();
             existing->relay_active = 0;
+            existing->relay_closed_at = 0;
             existing->up_bytes = existing->down_bytes = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
@@ -122,6 +123,7 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
             existing->fin_flags = 0;
             existing->mapping_id = next_mapping_id_locked();
             existing->relay_active = 0;
+            existing->relay_closed_at = 0;
             existing->up_bytes = existing->down_bytes = 0;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
@@ -432,7 +434,7 @@ BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
     while (conn != NULL)
     {
         if (conn->src_port == src_port && !conn->is_udp && conn->is_ipv6 == is_ipv6 &&
-            conn->mapping_id == mapping_id)
+            conn->mapping_id == mapping_id && conn->relay_closed_at == 0)
         {
             InterlockedExchange(&conn->relay_active, 1);
             InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
@@ -443,6 +445,30 @@ BOOL mark_tcp_relay_active(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
     }
 
     ReleaseSRWLockShared(&lock);
+    return found;
+}
+
+BOOL finish_tcp_relay(UINT16 src_port, BOOL is_ipv6, UINT32 mapping_id)
+{
+    if (mapping_id == 0) return FALSE;
+    BOOL found = FALSE;
+    AcquireSRWLockExclusive(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[src_port % CONNECTION_HASH_SIZE]; c; c = c->next)
+    {
+        if (c->src_port != src_port || c->is_udp || c->is_ipv6 != is_ipv6 || c->mapping_id != mapping_id)
+            continue;
+        // closesocket/IOCP completion does not mean WinDivert has handled every
+        // queued segment. Keep the reverse mapping through a bounded close grace period.
+        if (c->relay_closed_at == 0)
+        {
+            ULONGLONG now = GetTickCount64();
+            c->relay_closed_at = now ? now : 1;
+        }
+        InterlockedExchange(&c->relay_active, 0);
+        found = TRUE;
+        break;
+    }
+    ReleaseSRWLockExclusive(&lock);
     return found;
 }
 
@@ -490,13 +516,8 @@ void connection_fin(UINT16 src_port, BOOL is_ipv6, UINT8 bit)
     if (c != NULL)
     {
         c->fin_flags |= bit;
-        if (c->fin_flags == 3 && InterlockedCompareExchange(&c->relay_active, 0, 0) == 0)
-        {
-            *pp = c->next;
-            rev_unlink(c);
-            free(c);
-            port_clear(src_port, is_ipv6);
-        }
+        // Both FINs can be observed before their ACKs and retransmissions. Socket
+        // cleanup starts the grace timer; FIN observation must not delete the mapping.
     }
     ReleaseSRWLockExclusive(&lock);
 }
@@ -552,12 +573,17 @@ void cleanup_stale_connections(void)
             BOOL expired_udp = (*conn_ptr)->is_udp && idle_ms > UDP_MAPPING_IDLE_TIMEOUT_MS;
             BOOL expired_pending_tcp = !(*conn_ptr)->is_udp &&
                 InterlockedCompareExchange(&(*conn_ptr)->relay_active, 0, 0) == 0 &&
+                (*conn_ptr)->relay_closed_at == 0 &&
                 idle_ms > TCP_PENDING_MAPPING_TIMEOUT_MS;
-            if (expired_udp || expired_pending_tcp)
+            ULONGLONG closed_at = (*conn_ptr)->relay_closed_at;
+            BOOL expired_closing_tcp = !(*conn_ptr)->is_udp && closed_at != 0 &&
+                now >= closed_at && now - closed_at > TCP_CLOSING_MAPPING_TIMEOUT_MS;
+            if (expired_udp || expired_pending_tcp || expired_closing_tcp)
             {
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;
                 rev_unlink(to_free);              // must run under the exclusive lock
+                if (!to_free->is_udp) port_clear(to_free->src_port, to_free->is_ipv6);
                 free(to_free);
             }
             else

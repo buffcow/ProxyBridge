@@ -1460,7 +1460,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
     }
 
     // Handshake threads (connect to the proxy + SOCKS/HTTP negotiation) can still be mid-flight.
-    for (int i = 0; i < 700 && g_handler_threads > 0; i++) Sleep(50);    // up to 35 s
+    for (int i = 0; i < TCP_HANDLER_STOP_TIMEOUT_MS / 50 && g_handler_threads > 0; i++) Sleep(50);
     if (g_handler_threads > 0) log_message("Stop: %ld connection thread(s) still running", (long)g_handler_threads);
 
     if (g_fw_thread != NULL)

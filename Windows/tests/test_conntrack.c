@@ -143,6 +143,7 @@ int main(void)
       CHECK(current.orig_dest_ip == d2 && current.orig_dest_port == 80 &&
             current.pid == 2222 && current.rule_id == 32 && current.proxy_config_id == 6);
       CHECK(!mark_tcp_relay_active(61001, FALSE, old.mapping_id));
+      CHECK(!finish_tcp_relay(61001, FALSE, old.mapping_id));
       CHECK(!remove_connection_mapping(61001, FALSE, FALSE, old.mapping_id));
       CHECK(port_is_decided(61001, FALSE));
       CHECK(mark_tcp_relay_active(61001, FALSE, current.mapping_id));
@@ -169,15 +170,45 @@ int main(void)
       else printf("  note: uptime too short to age mappings past their idle timeout\n");
       remove_connection(61002, FALSE, FALSE);
       remove_connection(61003, TRUE, FALSE);
-      CHECK(remove_connection_mapping(61001, FALSE, FALSE, current.mapping_id));
-      CHECK(!port_is_decided(61001, FALSE)); }
+      CHECK(finish_tcp_relay(61001, FALSE, current.mapping_id));
+      CHECK(!mark_tcp_relay_active(61001, FALSE, current.mapping_id));
+      CHECK(get_connection(61001, FALSE, &dip, &dport) && dip == d2 && dport == 80);
+      connection_fin(61001, FALSE, 1); connection_fin(61001, FALSE, 2);
+      cleanup_stale_connections();
+      CHECK(is_connection_tracked(61001, FALSE, FALSE));
+      CHECK(port_is_decided(61001, FALSE));
+
+      /* Late packets and repeated worker completion must not extend the close grace forever. */
+      now = GetTickCount64();
+      if (now > TCP_CLOSING_MAPPING_TIMEOUT_MS + 1000)
+      {
+          AcquireSRWLockExclusive(&lock);
+          for (CONNECTION_INFO *c = connection_hash_table[61001 % CONNECTION_HASH_SIZE]; c; c = c->next)
+              if (c->src_port == 61001) c->relay_closed_at = now - TCP_CLOSING_MAPPING_TIMEOUT_MS - 1000;
+          ReleaseSRWLockExclusive(&lock);
+          CHECK(finish_tcp_relay(61001, FALSE, current.mapping_id));
+          CHECK(get_connection(61001, FALSE, &dip, &dport)); /* refreshes last_activity */
+          cleanup_stale_connections();
+          CHECK(!is_connection_tracked(61001, FALSE, FALSE));
+          CHECK(!port_is_decided(61001, FALSE));
+      }
+      remove_connection(61001, FALSE, FALSE); }
 
     /* Before a relay claims a flow, a single FIN must not drop its destination. */
     add_connection_v6(61004, FALSE, s6, dst6, 443, 0, 1, 0);
     connection_fin(61004, TRUE, 1);
     CHECK(is_connection_tracked(61004, FALSE, TRUE));
     connection_fin(61004, TRUE, 2);
-    CHECK(!is_connection_tracked(61004, FALSE, TRUE));
+    CHECK(is_connection_tracked(61004, FALSE, TRUE)); /* final ACK still needs translation */
+    { CONNECTION_CONFIG closing = {0}, fresh = {0};
+      CHECK(get_tcp_connection_config(61004, TRUE, &closing));
+      CHECK(finish_tcp_relay(61004, TRUE, closing.mapping_id));
+      add_connection_v6(61004, FALSE, s6, dst6, 8443, 0, 1, 0);
+      CHECK(get_tcp_connection_config(61004, TRUE, &fresh));
+      CHECK(fresh.mapping_id != closing.mapping_id && fresh.orig_dest_port == 8443);
+      CHECK(!finish_tcp_relay(61004, TRUE, closing.mapping_id));
+      CHECK(mark_tcp_relay_active(61004, TRUE, fresh.mapping_id)); }
+    remove_connection(61004, FALSE, TRUE);
 
     return pbtest_done("test_conntrack");
 }
