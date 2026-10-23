@@ -6,7 +6,7 @@
 // longer needs "Run as administrator".
 //
 // One client at a time. When the client goes away (exit or crash) the engine is stopped and
-// the core DLL is unloaded, so the next client starts from a clean state.
+// the core DLL is unloaded, and the service exits. The next GUI starts it on demand.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -48,9 +48,10 @@ static void SetState(DWORD state, DWORD exitCode)
 {
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCurrentState = state;
-    g_status.dwControlsAccepted = (state == SERVICE_START_PENDING) ? 0 : (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN);
+    g_status.dwControlsAccepted = state == SERVICE_RUNNING ? (SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN) : 0;
     g_status.dwWin32ExitCode = exitCode;
-    g_status.dwWaitHint = (state == SERVICE_STOP_PENDING || state == SERVICE_START_PENDING) ? 10000 : 0;
+    g_status.dwWaitHint = state == SERVICE_STOP_PENDING ? 120000 : state == SERVICE_START_PENDING ? 10000 : 0;
+    g_status.dwCheckPoint = (state == SERVICE_STOP_PENDING || state == SERVICE_START_PENDING) ? 1 : 0;
     if (g_ssh) SetServiceStatus(g_ssh, &g_status);
 }
 
@@ -269,6 +270,29 @@ static DWORD WINAPI ConnThread(LPVOID a)
     return 0;
 }
 
+// Bound startup with no client, and remain responsive to SCM stop while accepting.
+static BOOL WaitPipeClient(HANDLE pipe, DWORD timeout)
+{
+    ConnJob cj = { pipe, FALSE };
+    HANDLE thread = CreateThread(NULL, 0, ConnThread, &cj, 0, NULL);
+    if (!thread) return FALSE;
+    ULONGLONG deadline = GetTickCount64() + timeout;
+    DWORD result;
+    do {
+        result = WaitForSingleObject(thread, 100);
+    } while (result == WAIT_TIMEOUT && !g_stop && GetTickCount64() < deadline);
+    if (result != WAIT_OBJECT_0)
+    {
+        // Repeated cancellation also covers the race before ConnectNamedPipe starts.
+        do {
+            CancelSynchronousIo(thread);
+            result = WaitForSingleObject(thread, 100);
+        } while (result == WAIT_TIMEOUT);
+    }
+    CloseHandle(thread);
+    return cj.ok && !g_stop;
+}
+
 static void ServeClient(void)
 {
     BYTE req[PB_MSG_MAX], rsp[PB_MSG_MAX];
@@ -289,6 +313,10 @@ static void ServeClient(void)
         if (!WriteFile(g_ctl, rsp, w.len, &wr, NULL)) break;
     }
 
+    // Publish STOP_PENDING before cleanup so an immediately reopened GUI waits for
+    // this instance to exit instead of treating its old pipes as another active GUI.
+    InterlockedExchange(&g_stop, 1);
+    SetState(SERVICE_STOP_PENDING, 0);
     // client gone: stop capture and unload the engine (DllMain detach frees rules/configs)
     InterlockedExchange(&g_evt_live, 0);
     if (g_api.Stop) g_api.Stop();
@@ -303,27 +331,30 @@ static DWORD WINAPI WorkerMain(LPVOID arg)
     // Every pipe instance is created with FILE_FLAG_FIRST_PIPE_INSTANCE: if another process already
     // owns the pipe name (squatting), creation fails and we retry instead of serving next to it.
     const BOOL first = TRUE;
+    ULONGLONG startup_deadline = GetTickCount64() + 30000;
     while (!g_stop)
     {
         g_ctl = MakePipe(PB_PIPE_CTL, first, PIPE_ACCESS_DUPLEX);
         g_evt = MakePipe(PB_PIPE_EVT, first, PIPE_ACCESS_OUTBOUND);
-        if (g_ctl == INVALID_HANDLE_VALUE || g_evt == INVALID_HANDLE_VALUE) { ClosePipes(); Sleep(1000); continue; }
-
-        if (!ConnectNamedPipe(g_ctl, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) { ClosePipes(); continue; }
-        if (g_stop) { ClosePipes(); break; }
-
-        ConnJob cj = { g_evt, FALSE };
-        HANDLE ct = CreateThread(NULL, 0, ConnThread, &cj, 0, NULL);
-        if (ct)
+        if (g_ctl == INVALID_HANDLE_VALUE || g_evt == INVALID_HANDLE_VALUE)
         {
-            if (WaitForSingleObject(ct, 5000) == WAIT_TIMEOUT)
+            ClosePipes();
+            if (GetTickCount64() >= startup_deadline)
             {
-                CancelSynchronousIo(ct);
-                WaitForSingleObject(ct, INFINITE);
+                InterlockedExchange(&g_stop, 1);
+                SetState(SERVICE_STOP_PENDING, 0);
+                break;
             }
-            CloseHandle(ct);
+            Sleep(1000);
+            continue;
         }
-        if (cj.ok && !g_stop) ServeClient();
+
+        if (WaitPipeClient(g_ctl, 30000) && WaitPipeClient(g_evt, 5000))
+            ServeClient();
+        // One client session per service process, including a failed startup. No
+        // idle service is left behind after a missing event pipe or engine-load failure.
+        InterlockedExchange(&g_stop, 1);
+        SetState(SERVICE_STOP_PENDING, 0);
         ClosePipes();
     }
     return 0;

@@ -174,23 +174,54 @@ static BOOL IpcStart(void) { PBIPC_BEGIN(PBOP_START); PBIPC_END(); }
 static BOOL IpcStop(void)  { PBIPC_BEGIN(PBOP_STOP);  PBIPC_END(); }
 
 // Asks the SCM to start the service (the installer grants interactive users this right).
-static void PbIpcTryStartService(void)
+static BOOL PbIpcTryStartService(ULONGLONG deadline)
 {
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-    if (!scm) return;
+    if (!scm) return FALSE;
+    BOOL ready = FALSE;
     SC_HANDLE svc = OpenServiceW(scm, PB_SERVICE_NAME, SERVICE_START | SERVICE_QUERY_STATUS);
     if (svc)
     {
-        StartServiceW(svc, 0, NULL);
         SERVICE_STATUS st;
-        for (int i = 0; i < 50; i++)    // up to ~5 s for START_PENDING -> RUNNING
+        while (GetTickCount64() < deadline)
         {
-            if (!QueryServiceStatus(svc, &st) || st.dwCurrentState == SERVICE_RUNNING) break;
+            if (!QueryServiceStatus(svc, &st)) break;
+            if (st.dwCurrentState == SERVICE_RUNNING) { ready = TRUE; break; }
+            if (st.dwCurrentState == SERVICE_STOPPED)
+            {
+                if (!StartServiceW(svc, 0, NULL))
+                {
+                    DWORD err = GetLastError();
+                    if (err != ERROR_SERVICE_ALREADY_RUNNING && err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL) break;
+                }
+            }
+            else if (st.dwCurrentState != SERVICE_START_PENDING && st.dwCurrentState != SERVICE_STOP_PENDING)
+                break;
+            // The previous GUI may have just exited. Wait for STOPPED before
+            // requesting a new process; StartService during STOP_PENDING fails.
             Sleep(100);
         }
         CloseServiceHandle(svc);
     }
     CloseServiceHandle(scm);
+    return ready;
+}
+
+static BOOL PbIpcServiceIsStopping(void)
+{
+    BOOL stopping = FALSE;
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!scm) return FALSE;
+    SC_HANDLE svc = OpenServiceW(scm, PB_SERVICE_NAME, SERVICE_QUERY_STATUS);
+    if (svc)
+    {
+        SERVICE_STATUS st;
+        if (QueryServiceStatus(svc, &st))
+            stopping = st.dwCurrentState == SERVICE_STOP_PENDING || st.dwCurrentState == SERVICE_STOPPED;
+        CloseServiceHandle(svc);
+    }
+    CloseServiceHandle(scm);
+    return stopping;
 }
 
 // Any user can create a named pipe, so a process other than our service could be listening on
@@ -251,11 +282,18 @@ static int PB_LoadService(PBApi* api)
     }
 
     DWORD err = 0;
-    HANDLE ctl = PbIpcOpen(PB_PIPE_CTL, GENERIC_READ | GENERIC_WRITE, &err);
-    if (ctl == INVALID_HANDLE_VALUE && err == ERROR_FILE_NOT_FOUND)
+    HANDLE ctl = INVALID_HANDLE_VALUE;
+    ULONGLONG deadline = GetTickCount64() + 120000;
+    while (GetTickCount64() < deadline)
     {
-        PbIpcTryStartService();
+        if (!PbIpcTryStartService(deadline)) break;
         ctl = PbIpcOpen(PB_PIPE_CTL, GENERIC_READ | GENERIC_WRITE, &err);
+        if (ctl != INVALID_HANDLE_VALUE) break;
+        // RUNNING may be reported just before the pipe is created. Also retry
+        // old busy pipes while the previous session's service is stopping.
+        if (err != ERROR_FILE_NOT_FOUND &&
+            !(err == ERROR_PIPE_BUSY && PbIpcServiceIsStopping())) break;
+        Sleep(100);
     }
     if (ctl == INVALID_HANDLE_VALUE)
         return (err == ERROR_PIPE_BUSY) ? PB_IPC_BUSY : (err == ERROR_ACCESS_DENIED) ? PB_IPC_DENIED : PB_IPC_NO_SERVICE;

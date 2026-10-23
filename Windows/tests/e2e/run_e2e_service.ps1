@@ -7,7 +7,7 @@
 .DESCRIPTION
   run_e2e.ps1 tests the engine through the CLI. This one tests everything around it that the CLI never touches:
 
-    installer      silent install: files, service (auto start), "ProxyBridge Users" group, folder permissions, PATH, shortcuts
+    installer      silent install: files, service (on demand), "ProxyBridge Users" group, folder permissions, PATH, shortcuts
     permissions    a user outside the group is DENIED, a member can connect (needs a temporary local user; SKIP if not possible)
     service path   proxies, rules, start/stop, pause, Log Every Connection, traffic logging, rule enable/disable/move/delete,
                    a second client (BUSY), a client that dies (the engine is released), with real traffic
@@ -133,6 +133,26 @@ function Conn-Text([string]$proc) { (@($script:driver.Events() | Where-Object { 
 function Conn-Events([string]$proc) { @($script:driver.Events() | Where-Object { $_ -match "^EVT`tCONN`t[^`t]*$([regex]::Escape($proc))`t" }).Count }
 function Probe([string]$exe = $svcClient) { ((& $exe --probe 2>&1 | Out-String).Trim() -split "`n")[0].Trim() }
 
+function Wait-ServiceStopped {
+    $until = [DateTime]::UtcNow.AddSeconds(150)
+    do {
+        $service = Get-Service ProxyBridgeSvc -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq 'Stopped' -and
+            -not (Get-Process ProxyBridgeSvc -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $until)
+    return $false
+}
+
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class PbExitWindow {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+
 function Via-Open([string]$label, [string]$client, [string]$url = 'http://example.com/') {
     $before = Count $logOpen '[CONNECT]'
     $r = Get-Ok $client $url 'Example Domain'
@@ -150,11 +170,10 @@ try {
     $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
     Check 'Installer finishes silently' ($p.ExitCode -eq 0) "exit code $($p.ExitCode)"
     $svc = Get-Service ProxyBridgeSvc -ErrorAction SilentlyContinue
-    for ($i = 0; $i -lt 30 -and $svc -and $svc.Status -ne 'Running'; $i++) { Start-Sleep -Seconds 1; $svc.Refresh() }
     Check 'Installed files: app, CLI, engine, service, driver, uninstaller' (@('ProxyBridge.exe', 'ProxyBridge_CLI.exe', 'ProxyBridgeCore.dll', 'ProxyBridgeSvc.exe', 'WinDivert.dll', 'WinDivert64.sys', 'uninst.exe' |
         Where-Object { -not (Test-Path (Join-Path $inst $_)) }).Count -eq 0) "folder $inst"
-    Check 'The ProxyBridge Service exists and is running' ($svc -and $svc.Status -eq 'Running') "status $(if ($svc) { $svc.Status } else { 'missing' })"
-    Check 'The service starts with Windows (automatic)' ((& sc.exe qc ProxyBridgeSvc | Out-String) -match 'AUTO_START')
+    Check 'The ProxyBridge Service is installed but stopped' ($svc -and $svc.Status -eq 'Stopped') "status $(if ($svc) { $svc.Status } else { 'missing' })"
+    Check 'The service starts on demand' ((& sc.exe qc ProxyBridgeSvc | Out-String) -match 'DEMAND_START')
     Check 'The "ProxyBridge Users" group exists' ((& net.exe localgroup 'ProxyBridge Users' 2>&1 | Out-String) -match 'ProxyBridge Users')
     $usersLine = @(& icacls.exe $inst) | Where-Object { $_ -match 'BUILTIN\\Users:' } | Select-Object -First 1
     Check 'Install folder: ordinary users can read and run, not modify' ($usersLine -match '\(RX\)' -and $usersLine -notmatch '\((F|M|W)\)') "$usersLine"
@@ -335,11 +354,11 @@ try {
     $null = Svc-Id "rule`tpbe_after.exe`t*`t*`t*`ttcp`tproxy`t$pA`t0"
     Via-Open 'Before the kill: a fresh rule proxies' $exe.after
     $driver.Kill(); $driver = $null
-    Start-Sleep -Seconds 4
-    Check 'The service keeps running after its client was killed' ((Get-Service ProxyBridgeSvc).Status -eq 'Running')
+    Check 'The service stops and its process exits after its client was killed' (Wait-ServiceStopped)
     Direct-Open 'The engine was released: the program is no longer proxied' $exe.after
     $p2 = Probe
-    Check 'A new client can connect after the old one died' ($p2 -eq 'CONNECTED') "answer: $p2"
+    Check 'A new client starts the stopped service after the old one died' ($p2 -eq 'CONNECTED') "answer: $p2"
+    Check 'A probe disconnect also stops its service instance' (Wait-ServiceStopped)
 
     # ======================= the real app =======================
     Write-Host "`n=== the real ProxyBridge app applies a profile to the service" -ForegroundColor Cyan
@@ -362,14 +381,29 @@ try {
         Start-Sleep -Seconds 5
         Check 'The app connected to the service (the service is busy for others)' ((Probe) -match 'BUSY')
         Via-Open 'The profile rule is applied: the program goes through the proxy' $exe.gui
+        $guiWindow = $gui.MainWindowHandle
         [void]$gui.CloseMainWindow()
-        # closing the window sends the app to the tray (it keeps running); end it the hard way, like quitting from a crash
+        # Closing to tray is not Exit: the service must keep routing until the actual Exit command.
         Start-Sleep -Seconds 2
-        if (-not $gui.HasExited) { Stop-Process -Id $gui.Id -Force }
-        Start-Sleep -Seconds 3
-        Check 'The service keeps running after the app closed' ((Get-Service ProxyBridgeSvc).Status -eq 'Running')
+        Check 'Closing to tray keeps the client and service running' (-not $gui.HasExited -and (Get-Service ProxyBridgeSvc).Status -eq 'Running')
+        # WM_COMMAND / IDM_TRAY_EXIT, the same handler used by the tray's Exit menu.
+        Check 'The real Exit command is delivered' ([PbExitWindow]::PostMessage($guiWindow, 0x0111, [IntPtr]231, [IntPtr]::Zero))
+        Check 'The client exits normally' ($gui.WaitForExit(150000))
+        Check 'Exit stops the service and removes its process' (Wait-ServiceStopped)
         Direct-Open 'After the app closed the engine is released (no proxy)' $exe.gui
-        Check 'The service accepts a new client after the app closed' ((Probe) -eq 'CONNECTED')
+
+        # Reopen the actual GUI from a stopped service and check routing again.
+        $oldAppData = $env:APPDATA; $env:APPDATA = $appData
+        try { $gui = Start-Process -FilePath (Join-Path $inst 'ProxyBridge.exe') -PassThru } finally { $env:APPDATA = $oldAppData }
+        for ($i = 0; $i -lt 60 -and -not $gui.HasExited; $i++) { $gui.Refresh(); if ($gui.MainWindowHandle -ne 0) { break }; Start-Sleep -Milliseconds 500 }
+        Check 'Reopening the GUI starts a fresh service' (-not $gui.HasExited -and $gui.MainWindowHandle -ne 0 -and (Get-Service ProxyBridgeSvc).Status -eq 'Running')
+        Start-Sleep -Seconds 5
+        Via-Open 'The reopened app applies its proxy profile' $exe.gui
+        [void][PbExitWindow]::PostMessage($gui.MainWindowHandle, 0x0111, [IntPtr]231, [IntPtr]::Zero)
+        Check 'The reopened client exits normally' ($gui.WaitForExit(150000))
+        # Do not wait for the service here: exercise reconnect during STOP_PENDING.
+        Check 'An immediate new client waits for shutdown and reconnects' ((Probe) -eq 'CONNECTED')
+        Check 'The final client disconnect leaves no service process' (Wait-ServiceStopped)
     }
 }
 catch {

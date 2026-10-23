@@ -42,6 +42,7 @@ Universal proxy client for Windows applications - route any application through 
    - Add the install directory to your system PATH (GUI, CLI, and DLL all accessible)
    - Create Start Menu shortcuts for the GUI application
    - Include all required dependencies (WinDivert driver)
+   - Register `ProxyBridgeSvc` for on-demand startup; reinstalling also updates an older automatic-start service
 
 
 
@@ -50,7 +51,10 @@ Universal proxy client for Windows applications - route any application through 
 
 ### GUI Application
 
-Launch `ProxyBridge.exe` with Administrator privileges for an intuitive graphical interface.
+Launch the installed `ProxyBridge.exe` as your normal user. It starts the engine service when needed.
+Choosing **Exit** stops proxying and, after cleanup, stops the service process. Opening the app again
+starts a fresh service. Closing to the system tray keeps the client and service running.
+Portable copies without an installed service still require Administrator privileges.
 
 #### Proxy Settings
 

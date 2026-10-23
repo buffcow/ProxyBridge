@@ -183,5 +183,32 @@ int main(void)
           CloseHandle(h1);
       } }
 
+    /* Idle or interrupted startup must not strand a ConnectNamedPipe worker. */
+    { wchar_t name[100]; _snwprintf_s(name, 100, _TRUNCATE, L"\\\\.\\pipe\\pbtest_wait_%lu", GetCurrentProcessId());
+      HANDLE pipe = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                                    1, 128, 128, 0, NULL);
+      CHECK(pipe != INVALID_HANDLE_VALUE);
+      if (pipe != INVALID_HANDLE_VALUE)
+      {
+          g_stop = 0;
+          CHECK(!WaitPipeClient(pipe, 50));
+          DisconnectNamedPipe(pipe);
+          HANDLE client = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+          CHECK(client != INVALID_HANDLE_VALUE);
+          if (client != INVALID_HANDLE_VALUE)
+          {
+              CHECK(WaitPipeClient(pipe, 1000));
+              CloseHandle(client);
+          }
+          DisconnectNamedPipe(pipe);
+          g_stop = 1;
+          CHECK(!WaitPipeClient(pipe, 1000));
+          g_stop = 0;
+          CloseHandle(pipe);
+      } }
+    SetState(SERVICE_STOP_PENDING, 0);
+    CHECK(g_status.dwCurrentState == SERVICE_STOP_PENDING && g_status.dwControlsAccepted == 0);
+    CHECK(g_status.dwWaitHint >= 120000 && g_status.dwCheckPoint != 0);
+
     return pbtest_done("test_service");
 }

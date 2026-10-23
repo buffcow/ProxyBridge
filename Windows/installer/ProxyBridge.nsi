@@ -106,7 +106,7 @@ Section "MainSection" SEC01
   Delete "$INSTDIR\libHarfBuzzSharp.dll"
   Delete "$INSTDIR\libSkiaSharp.dll"
 
-  ; Register the engine service once. It runs as LocalSystem and starts with Windows, so the
+  ; Register the engine service once. It runs as LocalSystem and starts on demand, so the
   ; ProxyBridge app itself never needs administrator rights. The service ACL lets interactive
   ; users start it (never stop or reconfigure it), in case it was stopped.
   nsExec::ExecToLog 'sc delete ProxyBridgeSvc'
@@ -114,12 +114,11 @@ Section "MainSection" SEC01
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridgeSvc.exe"'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridge.exe"'
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name=all program="$INSTDIR\ProxyBridge_CLI.exe"'
-  nsExec::ExecToLog 'sc create ProxyBridgeSvc binPath= "\"$INSTDIR\ProxyBridgeSvc.exe\"" start= auto DisplayName= "ProxyBridge Service"'
+  nsExec::ExecToLog 'sc create ProxyBridgeSvc binPath= "\"$INSTDIR\ProxyBridgeSvc.exe\"" start= demand DisplayName= "ProxyBridge Service"'
   nsExec::ExecToLog 'sc description ProxyBridgeSvc "Privileged traffic-redirection engine for ProxyBridge. Lets the ProxyBridge app run without administrator rights."'
   nsExec::ExecToLog 'sc sdset ProxyBridgeSvc "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"'
   ; Local group that may drive the service; the signed-in user is added to it.
   nsExec::ExecToLog '"$INSTDIR\ProxyBridgeSvc.exe" --setup-users'
-  nsExec::ExecToLog 'sc start ProxyBridgeSvc'
 
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\ProxyBridge.exe"
